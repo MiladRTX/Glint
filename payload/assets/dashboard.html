@@ -1,0 +1,572 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Glint</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27 viewBox%3D%270 0 100 100%27%3E%3Cstyle%3Erect%7Bfill%3A%230A0A0A%7Dpath%7Bfill%3A%23fff%7D%40media (prefers-color-scheme%3Adark)%7Brect%7Bfill%3A%23fff%7Dpath%7Bfill%3A%230A0A0A%7D%7D%3C%2Fstyle%3E%3Crect width%3D%27100%27 height%3D%27100%27 rx%3D%2722%27%2F%3E%3Cpath transform%3D%27translate(28.24 19) scale(.62)%27 d%3D%27M37.1 0L64.2 0L39.9 37.6L70.2 37.6L9.9 100L25.1 56L0 56Z%27%2F%3E%3C%2Fsvg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=Geist+Mono:wght@400&display=swap">
+<style>
+  /* Same tokens as the Windows client (app/src/main.cpp, Palette). Dark is the default. */
+  :root, [data-theme="dark"]{
+    --ink:#09090B; --raised:#18181B; --selected:#27272A; --line:#27272A; --line-hi:#3F3F46;
+    --text:#FAFAFA; --muted:#A1A1AA; --faint:#71717A;
+    --primary:#FAFAFA; --primary-hover:#E4E4E7; --on-primary:#09090B; --soft:rgba(250,250,250,.10);
+    --glass:rgba(9,9,11,.72); --glass-hover:rgba(39,39,42,.9); --glass-line:rgba(255,255,255,.08);
+    --scrim:rgba(9,9,11,.55); --shadow:rgba(0,0,0,.5);
+    --live:#F04438; --live-soft:rgba(240,68,56,.16); --danger-text:#FCA5A5; --late:#F5A524;
+  }
+  [data-theme="light"]{
+    --ink:#FFFFFF; --raised:#F4F4F5; --selected:#FFFFFF; --line:#E4E4E7; --line-hi:#D4D4D8;
+    --text:#09090B; --muted:#71717A; --faint:#A1A1AA;
+    --primary:#18181B; --primary-hover:#27272A; --on-primary:#FAFAFA; --soft:rgba(24,24,27,.08);
+    --glass:rgba(255,255,255,.82); --glass-hover:rgba(244,244,245,.95); --glass-line:rgba(9,9,11,.08);
+    --scrim:rgba(9,9,11,.3); --shadow:rgba(0,0,0,.12);
+    --live:#DC2626; --live-soft:rgba(220,38,38,.10); --danger-text:#DC2626; --late:#D97706;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0}
+  body{
+    background:#000; color:var(--text); overflow:hidden;
+    font:14px/1.5 Geist,"Segoe UI Variable","Segoe UI",system-ui,-apple-system,sans-serif;
+    transition:color .25s;
+  }
+  .mono{font-family:"Geist Mono",ui-monospace,"Cascadia Mono",Consolas,monospace;font-size:12px}
+  button{font:inherit;color:inherit}
+  button:focus-visible,a:focus-visible{outline:2px solid var(--text);outline-offset:2px}
+  svg{flex:none}
+
+  main{position:fixed;inset:0;background:#000}
+  #view{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#000}
+  body.waiting main{background:var(--ink);transition:background .25s}
+
+  /* Chrome over the picture: fades and slides away when idle. */
+  .chrome{transition:opacity .35s ease, transform .35s ease}
+  body.idle .chrome{opacity:0;pointer-events:none}
+  body.idle .top{transform:translateY(-10px)}
+  body.idle .dock{transform:translate(-50%,14px)}
+  body.idle{cursor:none}
+  .glass{background:var(--glass);border:1px solid var(--glass-line);backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px)}
+
+  .top{position:absolute;top:max(16px,env(safe-area-inset-top));left:16px;right:16px;display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap}
+  .status{display:flex;align-items:center;gap:12px;height:44px;padding:0 16px 0 14px;border-radius:999px;min-width:0}
+  .dot{width:8px;height:8px;border-radius:50%;background:var(--faint);flex:none}
+  .status.live .dot{background:var(--text);box-shadow:0 0 0 3px var(--soft)}
+  .status.connecting .dot{animation:pulse 1.2s ease-out infinite}
+  .status.failed .dot{background:var(--live)}
+  @keyframes pulse{0%{box-shadow:0 0 0 0 var(--soft)}100%{box-shadow:0 0 0 8px transparent}}
+  .name{font-weight:500}
+  .muted{color:var(--muted)}
+  #state{font-size:13px;white-space:nowrap}
+  #strip{display:flex;align-items:flex-end;gap:1px;height:18px}
+  #strip i{display:block;width:2px;height:3px;border-radius:1px;background:currentColor;opacity:.55;transition:height .12s}
+  #strip i.late{color:var(--late);opacity:1}
+  .actions{display:flex;gap:8px}
+  .round{width:44px;height:44px;display:grid;place-items:center;border-radius:999px;cursor:pointer;transition:background .2s}
+  .round:hover{background:var(--glass-hover)}
+
+  .dock{position:absolute;left:50%;bottom:max(20px,env(safe-area-inset-bottom));transform:translateX(-50%);display:flex;align-items:center;gap:6px;padding:6px;border-radius:999px;max-width:calc(100% - 24px);overflow-x:auto;scrollbar-width:none;box-shadow:0 8px 24px var(--shadow)}
+  .dock::-webkit-scrollbar{display:none}
+  .btn{height:44px;display:inline-flex;align-items:center;gap:8px;padding:0 14px;border:0;border-radius:999px;background:transparent;color:var(--muted);font-weight:500;cursor:pointer;white-space:nowrap;transition:background .2s,color .2s,transform .1s}
+  .btn:hover{background:var(--soft);color:var(--text)}
+  .btn:active{transform:scale(.97)}
+  .btn:disabled{opacity:.4;cursor:default}
+  .btn.rec.on{background:var(--live-soft);color:var(--danger-text)}
+  .recdot{width:10px;height:10px;border-radius:50%;border:1.75px solid currentColor}
+  .btn.rec.on .recdot{background:var(--live);border-color:var(--live);animation:beat 1.4s ease-in-out infinite}
+  @keyframes beat{50%{opacity:.45}}
+  .sep{width:1px;height:24px;background:var(--glass-line);flex:none}
+  .vol{display:flex;align-items:center;gap:10px;padding-right:8px}
+  input[type=range]{-webkit-appearance:none;appearance:none;width:96px;height:20px;background:transparent;cursor:pointer}
+  input[type=range]::-webkit-slider-runnable-track{height:4px;border-radius:999px;background:linear-gradient(var(--text),var(--text)) 0/var(--fill,100%) 100% no-repeat,var(--line-hi)}
+  input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:14px;height:14px;margin-top:-5px;border-radius:50%;background:var(--text);transition:transform .15s}
+  input[type=range]:hover::-webkit-slider-thumb{transform:scale(1.15)}
+  input[type=range]::-moz-range-track{height:4px;border-radius:999px;background:var(--line-hi)}
+  input[type=range]::-moz-range-progress{height:4px;border-radius:999px;background:var(--text)}
+  input[type=range]::-moz-range-thumb{width:14px;height:14px;border:0;border-radius:50%;background:var(--text)}
+
+  /* Centre message when there is no picture. */
+  #msg{position:absolute;inset:0;display:grid;place-items:center;padding:24px;pointer-events:none;opacity:0;transition:opacity .25s}
+  body.waiting #msg{opacity:1}
+  #msg div{max-width:440px}
+  #msg h1{margin:0 0 8px;font-size:28px;font-weight:600;letter-spacing:-.02em;line-height:1.15}
+  #msg p{margin:0;color:var(--muted);line-height:1.55}
+  .brand{display:flex;align-items:center;gap:8px;margin-bottom:18px;font-size:15px;font-weight:600;color:var(--text)}
+  .brand svg{height:22px;width:auto;flex:none}
+  .dots{display:flex;gap:8px;margin-top:18px}
+  .dots i{width:7px;height:7px;border-radius:50%;background:var(--text);animation:dots 1.1s ease-in-out infinite}
+  .dots i:nth-child(2){animation-delay:.15s}.dots i:nth-child(3){animation-delay:.3s}
+  @keyframes dots{0%,100%{opacity:.25;transform:scale(.8)}50%{opacity:1;transform:scale(1)}}
+
+  /* Console recordings: a sheet from the right. */
+  .scrim{position:fixed;inset:0;background:var(--scrim);opacity:0;pointer-events:none;transition:opacity .28s}
+  .scrim.open{opacity:1;pointer-events:auto}
+  #sheet{position:fixed;top:0;right:0;bottom:0;width:min(440px,100%);background:var(--ink);border-left:1px solid var(--line);display:flex;flex-direction:column;transform:translateX(100%);transition:transform .32s cubic-bezier(.22,1,.36,1);box-shadow:-12px 0 32px var(--shadow)}
+  #sheet.open{transform:none}
+  .sheet-head{display:flex;align-items:center;justify-content:space-between;padding:20px 24px 16px}
+  .sheet-head h2{margin:0;font-size:18px;font-weight:600;letter-spacing:-.01em}
+  .close{width:40px;height:40px;display:grid;place-items:center;border:0;border-radius:8px;background:transparent;color:var(--muted);cursor:pointer}
+  .close:hover{background:var(--soft);color:var(--text)}
+  #recs{list-style:none;margin:0 24px;padding:0;border:1px solid var(--line);border-radius:12px;overflow:auto}
+  #recs li{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 16px}
+  #recs li+li{border-top:1px solid var(--line)}
+  #recs .file{min-width:0}
+  #recs .file b{display:block;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  #recs .file span{font-size:12px}
+  #recs .empty{display:block;color:var(--muted);text-align:center;padding:28px 16px}
+  .dl{height:36px;display:inline-flex;align-items:center;gap:6px;padding:0 12px;border:1px solid var(--line);border-radius:8px;color:var(--text);text-decoration:none;font-weight:500;font-size:13px;transition:background .2s,border-color .2s}
+  .dl:hover{background:var(--raised);border-color:var(--line-hi)}
+  .sheet-foot{margin-top:auto;padding:14px 24px;border-top:1px solid var(--line);font-size:12px;color:var(--faint)}
+
+  /* Stop capture: confirmation dialog. */
+  #dialog{position:fixed;left:50%;top:50%;width:min(460px,calc(100% - 32px));padding:24px;border-radius:14px;background:var(--ink);border:1px solid var(--line);box-shadow:0 24px 64px var(--shadow);display:flex;flex-direction:column;gap:14px;transform:translate(-50%,-46%) scale(.97);opacity:0;pointer-events:none;transition:opacity .2s,transform .25s cubic-bezier(.22,1,.36,1)}
+  #dialog.open{opacity:1;pointer-events:auto;transform:translate(-50%,-50%)}
+  #dialog h2{margin:0;font-size:18px;font-weight:600;letter-spacing:-.01em}
+  #dialog p{margin:0;color:var(--muted);line-height:1.55}
+  .row{display:flex;justify-content:flex-end;gap:8px;flex-wrap:wrap;margin-top:6px}
+  .b{height:40px;padding:0 16px;border-radius:8px;font-weight:500;cursor:pointer;transition:background .2s,filter .2s}
+  .b.outline{border:1px solid var(--line);background:transparent}
+  .b.outline:hover{background:var(--raised)}
+  .b.danger{border:0;background:var(--live);color:#fff}
+  .b.danger:hover{filter:brightness(.92)}
+
+  .toast{position:fixed;left:50%;bottom:96px;transform:translate(-50%,10px);padding:10px 16px;border-radius:12px;background:var(--raised);border:1px solid var(--line);box-shadow:0 8px 24px var(--shadow);opacity:0;pointer-events:none;transition:opacity .22s,transform .3s cubic-bezier(.22,1,.36,1);white-space:nowrap}
+  .toast.show{opacity:1;transform:translate(-50%,0)}
+
+  @media (max-width:640px){
+    .btn .label{display:none}
+    .btn{padding:0 12px}
+    input[type=range]{width:72px}
+    #strip,#rate{display:none}
+  }
+  @media (prefers-reduced-motion:reduce){
+    *,*::before,*::after{transition-duration:.01ms!important;animation:none!important}
+  }
+</style>
+</head>
+<body class="waiting">
+<main>
+  <video id="view" muted autoplay playsinline></video>
+
+  <div id="msg" role="status" aria-live="polite">
+    <div>
+      <div class="brand" aria-hidden="true"><svg viewBox="0 0 70.2 100"><path d="M37.1 0L64.2 0L39.9 37.6L70.2 37.6L9.9 100L25.1 56L0 56Z" fill="currentColor"/></svg>Glint</div>
+      <h1 id="msgtitle">Connecting to your PS5</h1>
+      <p id="msgtext">Talking to the Glint payload.</p>
+      <div class="dots" id="dots" aria-hidden="true"><i></i><i></i><i></i></div>
+    </div>
+  </div>
+
+  <div class="top chrome">
+    <section class="status glass connecting" id="status" aria-label="Connection">
+      <span class="dot"></span>
+      <span class="name">PS5</span>
+      <span class="muted" id="state">Connecting</span>
+      <span id="strip" title="Last second of frames. Taller amber bars arrived late." aria-hidden="true"></span>
+      <span class="mono muted" id="rate"></span>
+      <span class="muted" id="viewers" style="font-size:13px"></span>
+    </section>
+    <nav class="actions" aria-label="Page">
+      <button class="round glass" id="files" aria-label="Console recordings" title="Console recordings">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.93a2 2 0 0 1-1.66-.9l-.82-1.2A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13c0 1.1.9 2 2 2Z"/></svg>
+      </button>
+      <button class="round glass" id="theme" aria-label="Switch to light theme" title="Light or dark">
+        <svg id="themeicon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>
+      </button>
+      <button class="round glass" id="full" aria-label="Full screen" title="Full screen">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 3H5a2 2 0 0 0-2 2v3"/><path d="M21 8V5a2 2 0 0 0-2-2h-3"/><path d="M3 16v3a2 2 0 0 0 2 2h3"/><path d="M16 21h3a2 2 0 0 0 2-2v-3"/></svg>
+      </button>
+    </nav>
+  </div>
+
+  <div class="dock glass chrome" role="toolbar" aria-label="Controls">
+    <div class="vol">
+      <button class="btn" id="audio" aria-pressed="false" title="Sound on or off">
+        <svg id="audioicon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><line x1="22" x2="16" y1="9" y2="15"/><line x1="16" x2="22" y1="9" y2="15"/></svg>
+        <span class="label">Sound</span>
+      </button>
+      <input type="range" id="volume" min="0" max="200" value="100" aria-label="Volume">
+    </div>
+    <span class="sep" aria-hidden="true"></span>
+    <button class="btn" id="snap" title="Save the current frame as PNG">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3z"/><circle cx="12" cy="13" r="3"/></svg>
+      <span class="label">Screenshot</span>
+    </button>
+    <button class="btn rec" id="rec" title="Record on the console's storage">
+      <span class="recdot" aria-hidden="true"></span>
+      <span class="label" id="reclabel">Record on console</span>
+    </button>
+    <span class="sep" aria-hidden="true"></span>
+    <button class="btn" id="stop" title="Stop capture on the console">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="14" height="14" x="5" y="5" rx="2"/></svg>
+      <span class="label">Stop capture</span>
+    </button>
+  </div>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+</main>
+
+<div class="scrim" id="scrim"></div>
+<aside id="sheet" aria-label="Console recordings" aria-hidden="true">
+  <div class="sheet-head">
+    <h2>Console recordings</h2>
+    <button class="close" id="sheetclose" aria-label="Close">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+    </button>
+  </div>
+  <ul id="recs"><li><span class="empty">Loading</span></li></ul>
+  <div class="sheet-foot">Saved on the PlayStation as H.264 without sound.</div>
+</aside>
+
+<div id="dialog" role="alertdialog" aria-modal="true" aria-labelledby="stoptitle" aria-describedby="stopdesc" aria-hidden="true">
+  <h2 id="stoptitle">Stop capture on the console?</h2>
+  <div id="stopdesc">
+    <p>Everyone watching loses the picture, and any console recording ends.</p>
+    <p style="margin-top:10px">Stopping can crash some consoles. To start Glint again afterwards, restart the PS5 first.</p>
+  </div>
+  <div class="row">
+    <button class="b outline" id="keep">Keep streaming</button>
+    <button class="b danger" id="confirmstop">Stop capture</button>
+  </div>
+</div>
+
+<script>
+"use strict";
+const $ = s => document.querySelector(s);
+const video = $("#view"), statusEl = $("#status");
+
+// ---- theme: dark by default, the choice is remembered in this browser ---------
+function setTheme(t){
+  document.documentElement.dataset.theme = t;
+  $("#theme").setAttribute("aria-label", t === "dark" ? "Switch to light theme" : "Switch to dark theme");
+  $("#themeicon").innerHTML = t === "dark"
+    ? '<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/>'
+    : '<path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/>';
+}
+let theme = "dark";
+try { theme = (localStorage.getItem("glint-theme") || localStorage.getItem("screenlink-theme")) === "light" ? "light" : "dark"; } catch (_) {}
+setTheme(theme);
+$("#theme").onclick = () => {
+  theme = theme === "dark" ? "light" : "dark";
+  setTheme(theme);
+  try { localStorage.setItem("glint-theme", theme); } catch (_) {}
+};
+
+// ---- small UI helpers -------------------------------------------------------------
+function toast(t){ const el=$("#toast"); el.textContent=t; el.classList.add("show"); clearTimeout(toast._t); toast._t=setTimeout(()=>el.classList.remove("show"),2400); }
+function waiting(title, text, busy){
+  document.body.classList.add("waiting");
+  $("#msgtitle").textContent=title; $("#msgtext").textContent=text; $("#dots").style.display=busy?"flex":"none";
+}
+function setState(kind, text){
+  statusEl.className="status glass "+kind; $("#state").textContent=text;
+}
+function hexToBytes(h){ const o=new Uint8Array(h.length/2); for(let i=0;i<o.length;i++) o[i]=parseInt(h.substr(i*2,2),16); return o; }
+function clock(s){ s=Math.round(s); const h=Math.floor(s/3600), m=Math.floor(s/60)%60, ss=s%60; return (h?h+":"+String(m).padStart(2,"0"):m)+":"+String(ss).padStart(2,"0"); }
+
+// Controls fade after 3 s without input (not while a sheet or dialog is open).
+let idleTimer=0;
+function wake(){
+  document.body.classList.remove("idle"); clearTimeout(idleTimer);
+  idleTimer=setTimeout(()=>{ if(!document.body.classList.contains("waiting") && !$("#sheet").classList.contains("open") && !$("#dialog").classList.contains("open")) document.body.classList.add("idle"); },3000);
+}
+["mousemove","pointerdown","keydown","touchstart"].forEach(e=>addEventListener(e,wake,{passive:true}));
+wake();
+
+// ---- frame strip: how late each of the last 60 frames arrived --------------------
+// Same idea as the client: arrival time minus the console's timestamp, relative to
+// the best case seen (which creeps 2 ms/s to follow clock drift).
+const strip=$("#strip"), bars=[];
+for(let i=0;i<60;i++){ const b=document.createElement("i"); strip.append(b); bars.push(b); }
+const late=new Array(60).fill(0);
+let paceInit=false, paceLast=0, paceUnw=0, paceT0=0, paceBase=0, paceLastArr=0;
+function pace(pts){
+  const now=performance.now();
+  if(!paceInit){ paceInit=true; paceLast=pts; paceUnw=0; paceT0=now; paceBase=0; paceLastArr=0; }
+  else { paceUnw+=((pts-paceLast)|0); paceLast=pts; }
+  const arr=now-paceT0, lateness=arr-paceUnw/90, dt=Math.max(0,arr-paceLastArr)/1000;
+  paceLastArr=arr; paceBase=Math.min(lateness,paceBase+2*dt);
+  late.push(lateness-paceBase); late.shift();
+}
+function drawStrip(){
+  for(let i=0;i<60;i++){
+    const ms=late[i], isLate=ms>12;
+    bars[i].style.height=(isLate?Math.min(18,6+ms*.25):3+Math.min(ms,12)*.25)+"px";
+    bars[i].classList.toggle("late",isLate);
+  }
+}
+setInterval(()=>{ if(!document.hidden && !document.body.classList.contains("waiting")) drawStrip(); },100);
+
+// ---- fMP4 boxes (for MSE) -----------------------------------------------------
+// The browser plays over plain HTTP on a LAN address, which is not a secure
+// context, so WebCodecs is unavailable. MSE works here: each Annex-B access unit
+// is wrapped as a fragmented-MP4 segment and appended to a <video>.
+const u32=n=>{const b=new Uint8Array(4);new DataView(b.buffer).setUint32(0,n>>>0);return b;};
+const u16=n=>{const b=new Uint8Array(2);new DataView(b.buffer).setUint16(0,n);return b;};
+const cat=a=>{let n=0;for(const x of a)n+=x.length;const o=new Uint8Array(n);let p=0;for(const x of a){o.set(x,p);p+=x.length;}return o;};
+const box=(t,...p)=>{const body=cat(p);const b=new Uint8Array(8+body.length);new DataView(b.buffer).setUint32(0,b.length);for(let i=0;i<4;i++)b[4+i]=t.charCodeAt(i);b.set(body,8);return b;};
+const MATRIX=cat([u32(0x10000),u32(0),u32(0),u32(0),u32(0x10000),u32(0),u32(0),u32(0),u32(0x40000000)]);
+const TS=90000;
+
+function initSegment(sps,pps,W,H){
+  const avcC=box('avcC',cat([new Uint8Array([1,sps[1],sps[2],sps[3],0xff,0xe1]),u16(sps.length),sps,new Uint8Array([1]),u16(pps.length),pps]));
+  const avc1=box('avc1',cat([new Uint8Array(6),u16(1),new Uint8Array(16),u16(W),u16(H),u32(0x480000),u32(0x480000),u32(0),u16(1),new Uint8Array(32),u16(0x18),new Uint8Array([0xff,0xff])]),avcC);
+  const stbl=box('stbl',box('stsd',u32(0),u32(1),avc1),box('stts',u32(0),u32(0)),box('stsc',u32(0),u32(0)),box('stsz',u32(0),u32(0),u32(0)),box('stco',u32(0),u32(0)));
+  const minf=box('minf',box('vmhd',u32(1),u32(0),u32(0)),box('dinf',box('dref',u32(0),u32(1),box('url ',u32(1)))),stbl);
+  const hdlr=box('hdlr',u32(0),u32(0),new Uint8Array([0x76,0x69,0x64,0x65]),u32(0),u32(0),u32(0),new Uint8Array([86,105,100,101,111,0]));
+  const mdia=box('mdia',box('mdhd',u32(0),u32(0),u32(0),u32(TS),u32(0),u16(0x55c4),u16(0)),hdlr,minf);
+  const tkhd=box('tkhd',new Uint8Array([0,0,0,7]),u32(0),u32(0),u32(1),u32(0),u32(0),u32(0),u32(0),u16(0),u16(0),u16(0),u16(0),MATRIX,u32(W<<16),u32(H<<16));
+  const mvhd=box('mvhd',u32(0),u32(0),u32(0),u32(TS),u32(0),u32(0x10000),u16(0x100),u16(0),u32(0),u32(0),MATRIX,new Uint8Array(24),u32(2));
+  return cat([
+    box('ftyp',new Uint8Array([0x69,0x73,0x6f,0x6d]),u32(0),new Uint8Array([0x69,0x73,0x6f,0x6d,0x69,0x73,0x6f,0x35,0x61,0x76,0x63,0x31])),
+    box('moov',mvhd,box('trak',tkhd,mdia),box('mvex',box('trex',u32(0),u32(1),u32(1),u32(0),u32(0),u32(0))))
+  ]);
+}
+
+function mediaSegment(avcc,key,dts,dur,seq){
+  const flags=key?0x02000000:0x01010000;
+  const tfdt=box('tfdt',new Uint8Array([1,0,0,0]),u32(Math.floor(dts/4294967296)),u32(dts>>>0));
+  const tfhd=box('tfhd',new Uint8Array([0,2,0,0]),u32(1));
+  const trun=box('trun',new Uint8Array([0,0,0x07,0x01]),u32(1),u32(0),u32(dur),u32(avcc.length),u32(flags));
+  const moof=box('moof',box('mfhd',u32(0),u32(seq)),box('traf',tfhd,tfdt,trun));
+  const off=moof.length+8;                         // data_offset (default-base-is-moof)
+  for(let i=0;i<moof.length-4;i++){ if(moof[i]===0x74&&moof[i+1]===0x72&&moof[i+2]===0x75&&moof[i+3]===0x6e){ new DataView(moof.buffer).setInt32(i+12,off); break; } }
+  return cat([moof,box('mdat',avcc)]);
+}
+
+function toAvcc(au){                                 // Annex-B AU -> length-prefixed NALs
+  const nals=[]; let i=0,s=-1;
+  while(i+3<=au.length){ if(au[i]===0&&au[i+1]===0&&au[i+2]===1){ if(s>=0){ let e=i; if(au[e-1]===0) e--; nals.push(au.subarray(s,e)); } s=i+3; i+=3; } else i++; }
+  if(s>=0) nals.push(au.subarray(s,au.length));
+  let tot=0; for(const n of nals) tot+=4+n.length;
+  const o=new Uint8Array(tot); let p=0, idr=false, vcl=false;
+  for(const n of nals){ const t=n[0]&0x1f; if(t>=1&&t<=5) vcl=true; if(t===5) idr=true;
+    o[p]=(n.length>>>24)&255;o[p+1]=(n.length>>>16)&255;o[p+2]=(n.length>>>8)&255;o[p+3]=n.length&255; o.set(n,p+4); p+=4+n.length; }
+  return {data:o,idr,vcl};
+}
+
+// ---- live video over MSE ------------------------------------------------------
+let ms=null, sb=null, ops=[], busy=false, seq=0, dts=0, dur=1500, started=false, haveFrame=false, videoAbort=null;
+
+function enqueue(op){ ops.push(op); drain(); }
+function drain(){
+  if(busy||!sb||sb.updating) return;
+  const op=ops.shift(); if(!op) return;
+  busy=true;
+  try{ if(op.t==="a") sb.appendBuffer(op.b); else sb.remove(op.s,op.e); }
+  catch(e){ busy=false; if(e.name==="QuotaExceededError"){ try{ const b=video.buffered; if(b.length) sb.remove(b.start(0), Math.max(b.start(0), video.currentTime-2)); }catch(_){} } }
+}
+
+async function startVideo(cfg){
+  ms=new MediaSource();
+  video.src=URL.createObjectURL(ms);
+  await new Promise(r=>ms.addEventListener("sourceopen",r,{once:true}));
+  try{ sb=ms.addSourceBuffer('video/mp4; codecs="'+(cfg.codec||"avc1.42e01f")+'"'); sb.mode="segments"; }
+  catch(e){ waiting("This browser can't play the stream","It cannot decode the console's H.264 picture. Use the Glint app for Windows.",false); return false; }
+  sb.addEventListener("updateend",()=>{ busy=false; drain(); });
+  sb.addEventListener("error",()=>{ busy=false; });
+  seq=0; dts=0; started=false; paceInit=false;
+  dur=Math.round(TS/(cfg.fps||60));
+  enqueue({t:"a", b:initSegment(hexToBytes(cfg.sps), hexToBytes(cfg.pps), cfg.width, cfg.height)});
+  return true;
+}
+
+function liveEdge(){
+  const b=video.buffered; if(!b.length) return;
+  const end=b.end(b.length-1);
+  if(end-video.currentTime>2.0) video.currentTime=end-0.25;          // catch up to live
+  if(video.currentTime-b.start(0)>8) enqueue({t:"r", s:b.start(0), e:video.currentTime-4});
+  if(video.paused) video.play().catch(()=>{});
+}
+
+async function pumpFrames(signal){
+  const res=await fetch("/frames",{cache:"no-store",signal});
+  const reader=res.body.getReader();
+  let buf=new Uint8Array(0);
+  const grow=(a,b)=>{ const n=new Uint8Array(a.length+b.length); n.set(a); n.set(b,a.length); return n; };
+  for(;;){
+    const {value,done}=await reader.read();
+    if(done) break;
+    buf=grow(buf,value);
+    for(;;){
+      if(buf.length<8) break;
+      const dv=new DataView(buf.buffer,buf.byteOffset,8);
+      const len=dv.getUint32(0), pts=dv.getUint32(4);
+      if(buf.length<8+len) break;
+      const unit=buf.slice(8,8+len);
+      buf=buf.slice(8+len);
+      pace(pts);
+      const {data,idr,vcl}=toAvcc(unit);
+      if(!vcl) continue;
+      if(!started && !idr) continue;                 // begin on an IDR
+      started=true;
+      enqueue({t:"a", b:mediaSegment(data,idr,dts,dur,seq++)});
+      dts+=dur;
+      if(!haveFrame && video.videoWidth){ haveFrame=true; document.body.classList.remove("waiting"); wake(); }
+      liveEdge();
+    }
+  }
+}
+
+// ---- audio: scheduled Web Audio (no AudioWorklet; works over plain HTTP) -------
+let audioCtx=null, gain=null, audioOn=false, audioAbort=null, playHead=0, chans=2, rate=48000;
+const volume=$("#volume");
+function showVolume(){ volume.style.setProperty("--fill",(volume.value/2)+"%"); if(gain) gain.gain.value=volume.value/100; }
+volume.oninput=showVolume; showVolume();
+function audioIcon(on){
+  $("#audioicon").innerHTML = on
+    ? '<polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/>'
+    : '<polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><line x1="22" x2="16" y1="9" y2="15"/><line x1="16" x2="22" y1="9" y2="15"/>';
+  $("#audio").setAttribute("aria-pressed", on ? "true" : "false");
+}
+async function enableAudio(cfg){
+  try{
+    chans=(cfg.audio&&cfg.audio.channels)||2; rate=(cfg.audio&&cfg.audio.rate)||48000;
+    audioCtx=new (window.AudioContext||window.webkitAudioContext)({sampleRate:rate});
+    gain=audioCtx.createGain(); gain.connect(audioCtx.destination); showVolume();
+    await audioCtx.resume();
+    playHead=audioCtx.currentTime+0.15;
+    audioAbort=new AbortController();
+    pumpAudio(audioAbort.signal).catch(()=>{});
+    audioOn=true; audioIcon(true); toast("Sound on");
+  }catch(e){ toast("Sound is not available in this browser"); }
+}
+function disableAudio(){ audioOn=false; audioIcon(false); if(audioAbort) audioAbort.abort(); if(audioCtx) audioCtx.close(); audioCtx=null; gain=null; }
+
+async function pumpAudio(signal){
+  const res=await fetch("/audio",{cache:"no-store",signal});
+  const reader=res.body.getReader();
+  let buf=new Uint8Array(0);
+  const grow=(a,b)=>{ const n=new Uint8Array(a.length+b.length); n.set(a); n.set(b,a.length); return n; };
+  for(;;){
+    const {value,done}=await reader.read();
+    if(done) break;
+    buf=grow(buf,value);
+    for(;;){
+      if(buf.length<8) break;
+      const dv=new DataView(buf.buffer,buf.byteOffset,8);
+      const len=dv.getUint32(0);
+      if(buf.length<8+len) break;
+      const pcm=new Float32Array(buf.slice(8,8+len).buffer);   // interleaved f32le
+      buf=buf.slice(8+len);
+      if(!audioCtx) continue;
+      const frames=pcm.length/chans;
+      const ab=audioCtx.createBuffer(chans, frames, rate);
+      for(let c=0;c<chans;c++){ const ch=ab.getChannelData(c); for(let i=0;i<frames;i++) ch[i]=pcm[i*chans+c]; }
+      const src=audioCtx.createBufferSource(); src.buffer=ab; src.connect(gain);
+      const now=audioCtx.currentTime;
+      if(playHead<now+0.02) playHead=now+0.08;       // underrun: nudge forward
+      if(playHead>now+0.5) playHead=now+0.25;        // drift: cap latency
+      src.start(playHead); playHead+=frames/rate;
+    }
+  }
+}
+
+// ---- status + controls --------------------------------------------------------
+async function poll(){
+  try{
+    const s=await (await fetch("/status.json",{cache:"no-store"})).json();
+    if(s.frames>0) setState("live", s.height?`${s.height}p${Math.round(s.fps||60)}`:"Live");
+    else setState("connecting","Starting");
+    $("#rate").textContent=((s.kbps||0)/1000).toFixed(1)+" Mbit/s";
+    $("#viewers").textContent=(s.clients||0)+" watching";
+    const r=$("#rec"); r.classList.toggle("on",!!s.recording);
+    $("#reclabel").textContent = s.recording ? clock(s.recording_seconds||0) : "Record on console";
+    r.title = s.recording ? "Stop the console recording" : "Record on the console's storage";
+  }catch(e){ setState("failed","Can't reach the console"); $("#rate").textContent=""; $("#viewers").textContent=""; }
+}
+async function post(path){ try{ const r=await fetch(path,{method:"POST"}); return r.ok; }catch(e){ return false; } }
+
+$("#audio").onclick=async()=>{ if(audioOn) disableAudio(); else await enableAudio(window.__cfg||{}); };
+$("#snap").onclick=()=>{
+  if(!video.videoWidth){ toast("No picture yet"); return; }
+  const c=document.createElement("canvas"); c.width=video.videoWidth; c.height=video.videoHeight;
+  c.getContext("2d").drawImage(video,0,0);
+  c.toBlob(b=>{ const a=document.createElement("a"); a.href=URL.createObjectURL(b);
+    a.download="Glint-Screenshot-"+new Date().toISOString().replace(/[:.]/g,"-")+".png"; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),4000); toast("Screenshot saved"); }, "image/png");
+};
+$("#rec").onclick=async()=>{
+  const on=$("#rec").classList.contains("on");
+  if(await post(on?"/record/stop":"/record/start")) toast(on?"Console recording saved":"Recording on the console");
+  else toast("The console did not accept the request");
+  setTimeout(poll,400);
+};
+$("#full").onclick=()=>{ if(document.fullscreenElement) document.exitFullscreen(); else document.documentElement.requestFullscreen().catch(()=>{}); };
+
+// Recordings sheet.
+function openSheet(on){
+  $("#sheet").classList.toggle("open",on); $("#sheet").setAttribute("aria-hidden",on?"false":"true");
+  $("#scrim").classList.toggle("open",on);
+  if(on){ loadRecs(); $("#sheetclose").focus(); } else wake();
+}
+$("#files").onclick=()=>openSheet(true);
+$("#sheetclose").onclick=()=>openSheet(false);
+$("#scrim").onclick=()=>{ openSheet(false); openDialog(false); };
+async function loadRecs(){
+  const ul=$("#recs"); ul.innerHTML='<li><span class="empty">Loading</span></li>';
+  try{
+    const list=await (await fetch("/recordings",{cache:"no-store"})).json();
+    if(!list.length){ ul.innerHTML='<li><span class="empty">No recordings yet. Use Record on console.</span></li>'; return; }
+    ul.innerHTML="";
+    for(const it of list){
+      const li=document.createElement("li");
+      const f=document.createElement("div"); f.className="file";
+      const b=document.createElement("b"); b.textContent=it.name;
+      const s=document.createElement("span"); s.className="mono muted"; s.textContent=(it.bytes/1048576).toFixed(1)+" MB";
+      f.append(b,s);
+      const a=document.createElement("a"); a.className="dl"; a.href="/recordings/"+encodeURIComponent(it.name); a.download=it.name; a.textContent="Download";
+      li.append(f,a); ul.append(li);
+    }
+  }catch(e){ ul.innerHTML='<li><span class="empty">Could not load the recordings.</span></li>'; }
+}
+
+// Stop capture: confirmation first.
+function openDialog(on){
+  $("#dialog").classList.toggle("open",on); $("#dialog").setAttribute("aria-hidden",on?"false":"true");
+  $("#scrim").classList.toggle("open",on || $("#sheet").classList.contains("open"));
+  if(on) $("#keep").focus(); else wake();
+}
+$("#stop").onclick=()=>openDialog(true);
+$("#keep").onclick=()=>openDialog(false);
+$("#confirmstop").onclick=async()=>{
+  openDialog(false);
+  await post("/stop");
+  setState("failed","Stopped");
+  waiting("Capture stopped","Restart the PS5 before starting Glint again.",false);
+};
+addEventListener("keydown",e=>{
+  if(e.key==="Escape"){ openDialog(false); openSheet(false); }
+  if(e.target.tagName==="INPUT") return;
+  if(e.key==="m"||e.key==="M") $("#audio").click();
+  if(e.key==="t"||e.key==="T") $("#theme").click();
+  if(e.key==="f"||e.key==="F") $("#full").click();
+});
+
+// ---- boot ---------------------------------------------------------------------
+async function connect(){
+  let cfg;
+  try{ cfg=await (await fetch("/config.json",{cache:"no-store"})).json(); }
+  catch(e){
+    setState("failed","Can't reach the console");
+    waiting("Can't reach your PS5","Check that the Glint payload is running on the console. Trying again.",true);
+    setTimeout(connect,2000); return;
+  }
+  window.__cfg=cfg;
+  haveFrame=false; waiting("Waiting for the picture","Connected. The first keyframe usually arrives within a second or two.",true);
+  if(!("MediaSource" in window)){ waiting("This browser can't play the stream","Use the Glint app for Windows, or a desktop browser.",false); return; }
+  if(!await startVideo(cfg)) return;
+  videoAbort=new AbortController();
+  pumpFrames(videoAbort.signal).catch(()=>{}).finally(()=>{
+    try{ videoAbort.abort(); if(ms&&ms.readyState==="open") ms.endOfStream(); }catch(_){}
+    sb=null; ops=[]; busy=false;
+    waiting("The stream ended","Reconnecting.",true);
+    setTimeout(connect,1500);
+  });
+}
+connect();
+poll(); setInterval(poll,1000);
+setInterval(()=>{ if(sb) liveEdge(); },2000);
+</script>
+</body>
+</html>

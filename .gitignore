@@ -1,0 +1,30 @@
+bin/
+obj/
+build/
+*.user
+*.suo
+*.o
+*.obj
+*.exe
+*.dll
+*.lib
+*.a
+*.elf
+*.h264
+*.pcm
+logs/
+hostdata*/
+
+# Static FFmpeg + curl from app/build_deps.sh (sources and built libraries)
+app/deps/
+
+# Editor / tool state
+.claude/
+.agents/
+skills-lock.json
+.cursor/
+.idea/
+.vscode/
+*.bak
+*.orig
+claude.md

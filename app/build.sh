@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+set -e
+cd "$(dirname "$0")"
+
+# Everything is linked in statically, with the minimal FFmpeg and curl from
+# build_deps.sh, so the exe needs only Windows and the graphics driver's
+# vulkan-1.dll (which has no static library and must come from the driver).
+if [ ! -f deps/prefix/lib/pkgconfig/libavcodec.pc ]; then
+  echo "app/deps/prefix is missing: run ./build_deps.sh once first" >&2
+  exit 1
+fi
+export PKG_CONFIG_PATH="$PWD/deps/prefix/lib/pkgconfig"
+
+# Compute shaders -> SPIR-V C arrays (the generated .inc is kept in the repo so
+# a machine without glslc still builds).
+if command -v glslc >/dev/null 2>&1; then
+  glslc -fshader-stage=compute --target-env=vulkan1.0 -O src/shaders/yuv_to_rgba.comp \
+    -mfmt=c -o src/shaders/yuv_to_rgba.spv.inc
+fi
+
+# The deps paths are given relative: pkg-config's absolute ones break on a
+# folder with spaces. It still supplies the libraries each one needs.
+DEPS="libavformat libavcodec libswscale libavutil libcurl"
+CFLAGS="-Ideps/prefix/include $(pkg-config --static --cflags-only-other $DEPS)"
+# SDL2 is used only for audio: drop its -Dmain=SDL_main / -mwindows / SDL2main.
+CFLAGS="$CFLAGS $(pkg-config --cflags-only-I sdl2)"
+LIBS="-Ldeps/prefix/lib $(pkg-config --static --libs-only-l $DEPS)"
+LIBS="$LIBS $(pkg-config --libs-only-L sdl2) $(pkg-config --static --libs-only-l sdl2 | sed 's/-lmingw32//; s/-lSDL2main//')"
+VULKAN="-Wl,-Bdynamic -lvulkan-1 -Wl,-Bstatic"
+
+mkdir -p build
+windres res/glint.rc -O coff -o build/glint_res.o
+
+# -mwindows: a Windows app, so no console window opens with it. Test modes
+# reattach to the terminal they were started from (attach_parent_console()).
+g++ -std=c++17 -O2 -static -mwindows \
+  -Iinclude -Isrc -Isrc/core -Isrc/media -Isrc/stream -Ivendor/imgui -Ivendor/imgui/backends \
+  $CFLAGS \
+  src/main.cpp \
+  src/core/app.cpp src/core/log.cpp src/core/payload_client.cpp src/core/settings.cpp \
+  src/media/audio.cpp src/media/decoder.cpp src/media/media.cpp src/media/player.cpp src/media/recorder.cpp \
+  src/stream/broadcast.cpp src/stream/destinations.cpp src/stream/oauth.cpp src/stream/tls_relay.cpp \
+  vendor/imgui/imgui.cpp \
+  vendor/imgui/imgui_draw.cpp \
+  vendor/imgui/imgui_tables.cpp \
+  vendor/imgui/imgui_widgets.cpp \
+  vendor/imgui/backends/imgui_impl_glfw.cpp \
+  vendor/imgui/backends/imgui_impl_vulkan.cpp \
+  build/glint_res.o \
+  -o build/Glint.exe \
+  $LIBS -lglfw3 $VULKAN -lgdi32 -luser32 -lshell32 -ladvapi32 -lsecur32 -lws2_32 -lbcrypt -lole32 -luuid -lz
+
+echo "built app/build/Glint.exe"
+
+# Headless transport probe / recorder (tests/run_probe.js, docs/CONSOLE.md).
+g++ -std=c++17 -O2 -static -Iinclude -Ideps/prefix/include $(pkg-config --static --cflags-only-other libcurl) \
+  tools/probe.cpp src/core/payload_client.cpp \
+  -o build/probe.exe \
+  -Ldeps/prefix/lib $(pkg-config --static --libs-only-l libcurl)
+
+echo "built app/build/probe.exe"
