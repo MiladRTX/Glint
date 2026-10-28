@@ -1204,13 +1204,13 @@ static ImU32 ink(ImU32 c) { return ImGui::GetColorU32(c); }   // applies style a
 // its top-left corner at `at`. Returns its width.
 static float draw_bolt(ImDrawList* dl, ImVec2 at, float height, ImU32 col)
 {
-    static const ImVec2 kBolt[] = {{37.1f, 0.0f}, {64.2f, 0.0f}, {39.9f, 37.6f}, {70.2f, 37.6f},
-                                   {9.9f, 100.0f}, {25.1f, 56.0f}, {0.0f, 56.0f}};
+    static const ImVec2 kBolt[] = {{24.26f, 0.0f}, {56.08f, 0.0f}, {34.17f, 33.28f}, {62.74f, 33.28f},
+                                   {7.15f, 100.0f}, {24.52f, 52.15f}, {0.0f, 52.15f}};
     float s = height / 100.0f;
     ImVec2 pts[7];
     for (int i = 0; i < 7; i++) pts[i] = ImVec2(at.x + kBolt[i].x * s, at.y + kBolt[i].y * s);
     dl->AddConcavePolyFilled(pts, 7, col);
-    return 70.2f * s;
+    return 62.74f * s;
 }
 
 static ImU32 mix(ImU32 a, ImU32 b, float t)

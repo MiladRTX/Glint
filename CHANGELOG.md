@@ -20,8 +20,9 @@ New logo: a black and white lightning bolt. It is the exe's icon (Explorer,
 taskbar, title bar), sits above the connect screen's title and in the Settings
 footer, is the dashboard's tab icon (black in a light browser, white in a dark
 one) and makes up the payload's 960x400 banner. `tools/make_brand.py` renders
-every size from one traced bolt into `docs/brand/`, `app/res/glint.ico` and
-`payload/assets/banner.png`. `Glint.exe` also carries its version in
+every size from the designs in `docs/brand/source/` (the bolt traced to a
+vector, the lettering cleaned into a mask) into `docs/brand/`,
+`app/res/glint.ico` and `payload/assets/banner.png`. `Glint.exe` also carries its version in
 Properties.
 
 ### Desktop app (Windows)

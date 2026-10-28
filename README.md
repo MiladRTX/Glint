@@ -2,7 +2,7 @@
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/brand/glint-logo-dark.png">
-  <img alt="Glint" src="docs/brand/glint-logo-light.png" width="260">
+  <img alt="Glint" src="docs/brand/glint-logo-light.png" width="300">
 </picture>
 
 **Watch, hear and record a jailbroken PS5 on your Windows PC, with low latency.**
@@ -257,7 +257,7 @@ payload/              PS5 payload (C11)
 tests/                mock payload, protocol smoke test, probe runner
 tools/                gen_blobs.js (embeds the web assets), make_brand.py (icons and logos)
 docs/                 build, API, console and internals docs
-└── brand/            logo, icons and the original design sheet
+└── brand/            logo and icons; source/ holds the original designs
 ```
 
 ## Documentation

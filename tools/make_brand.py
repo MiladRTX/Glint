@@ -1,28 +1,39 @@
-"""Renders every Glint brand asset from one vector bolt.
+"""Renders every Glint brand asset from the design sources in docs/brand/source.
 
     python tools/make_brand.py
 
-Needs Pillow. Writes:
+Needs Pillow and NumPy. The bolt is a vector (traced from
+bolt-black-on-white.png); the "Glint" lettering is a cleaned alpha mask cut from
+lockup-black-on-white.png. Writes:
   docs/brand/        SVG marks and icons, PNG icons and logo lockups (README)
   app/res/glint.ico  the exe and window icon (16-256 px; small sizes are bolder)
   payload/assets/banner.png  960x400 banner served by the payload
 The outputs are kept in the repo, so a build never needs Python.
 """
 import os
-from PIL import Image, ImageDraw, ImageFont
+import numpy as np
+from PIL import Image, ImageDraw
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BLACK = (10, 10, 10)
+SOURCE = os.path.join(ROOT, "docs", "brand", "source")
+BLACK = (0, 0, 0)
 WHITE = (255, 255, 255)
 
-# The bolt, traced from the design sheet (docs/brand/glint-sheet.png), in a box
-# 70.2 wide and 100 tall. main.cpp and dashboard.html carry the same points.
-BOLT = [(37.1, 0.0), (64.2, 0.0), (39.9, 37.6), (70.2, 37.6), (9.9, 100.0), (25.1, 56.0), (0.0, 56.0)]
-BOLT_W, BOLT_H = 70.2, 100.0
+# The bolt in a box 62.74 wide and 100 tall. main.cpp and dashboard.html carry
+# the same points.
+BOLT = [(24.26, 0.0), (56.08, 0.0), (34.17, 33.28), (62.74, 33.28), (7.15, 100.0), (24.52, 52.15), (0.0, 52.15)]
+BOLT_W, BOLT_H = 62.74, 100.0
 
 RADIUS = 0.22      # icon corner radius, share of the side
-BOLT_SHARE = 0.62  # bolt height, share of the icon side
+BOLT_SHARE = 0.64  # bolt height, share of the icon side
 SS = 4             # supersampling for smooth edges
+
+# Lockup proportions measured on lockup-black-on-white.png, in text heights:
+# the bolt is 1.355 tall, starts 0.083 above the lettering, and sits 0.136 before it.
+LOCK_BOLT = 1.355
+LOCK_RISE = 0.083
+LOCK_GAP = 0.136
+TEXT_BOX = (792, 225, 1634, 490)   # the lettering in the source image (x0, y0, x1, y1)
 
 
 def out(*parts):
@@ -31,9 +42,29 @@ def out(*parts):
     return path
 
 
-def bolt_points(cx, cy, height):
+def bolt_points(x, y, height):
+    """Bolt `height` tall with its box's top-left corner at (x, y)."""
     s = height / BOLT_H
-    return [(cx + (x - BOLT_W / 2) * s, cy + (y - BOLT_H / 2) * s) for x, y in BOLT]
+    return [(x + px * s, y + py * s) for px, py in BOLT]
+
+
+def wordmark_mask():
+    """The lettering as a clean 2x alpha mask: compression noise ramped away,
+    edges re-sharpened after the upscale."""
+    src = Image.open(os.path.join(SOURCE, "lockup-black-on-white.png")).convert("L")
+    x0, y0, x1, y1 = TEXT_BOX
+    pad = 6
+    crop = src.crop((x0 - pad, y0 - pad, x1 + 1 + pad, y1 + 1 + pad))
+    big = crop.resize((crop.width * 2, crop.height * 2), Image.LANCZOS)
+    ink = 255.0 - np.asarray(big, dtype=np.float32)          # lettering is dark
+    alpha = np.clip((ink - 96.0) / 64.0, 0.0, 1.0)          # 96..160 -> 0..1
+    alpha = alpha * alpha * (3 - 2 * alpha)                  # smoothstep
+    mask = Image.fromarray((alpha * 255).astype(np.uint8), "L")
+    p2 = pad * 2
+    return mask.crop((p2, p2, mask.width - p2, mask.height - p2))
+
+
+WORDMARK = None
 
 
 def icon(size, dark, bold=0.0):
@@ -45,7 +76,8 @@ def icon(size, dark, bold=0.0):
     d.rounded_rectangle([0, 0, big - 1, big - 1], radius=RADIUS * big, fill=bg + (255,))
     if not dark:   # a hairline so the white tile shows on white
         d.rounded_rectangle([0, 0, big - 1, big - 1], radius=RADIUS * big, outline=(0, 0, 0, 40), width=max(1, SS))
-    pts = bolt_points(big / 2, big / 2, big * BOLT_SHARE)
+    h = big * BOLT_SHARE
+    pts = bolt_points((big - h * BOLT_W / BOLT_H) / 2, (big - h) / 2, h)
     d.polygon(pts, fill=fg + (255,))
     if bold > 0:
         d.polygon(pts, outline=fg + (255,), width=max(1, round(bold * big)))
@@ -55,33 +87,37 @@ def icon(size, dark, bold=0.0):
 def mark(height, color):
     """The bare bolt on transparent."""
     h = height * SS
-    w = round(h * BOLT_W / BOLT_H) + 2 * SS
-    img = Image.new("RGBA", (w, h + 2 * SS), (0, 0, 0, 0))
-    ImageDraw.Draw(img).polygon(bolt_points(w / 2, (h + 2 * SS) / 2, h), fill=color + (255,))
-    return img.resize((max(1, w // SS), max(1, (h + 2 * SS) // SS)), Image.LANCZOS)
+    w = round(h * BOLT_W / BOLT_H)
+    img = Image.new("RGBA", (w + 2 * SS, h + 2 * SS), (0, 0, 0, 0))
+    ImageDraw.Draw(img).polygon(bolt_points(SS, SS, h), fill=color + (255,))
+    return img.resize((img.width // SS, img.height // SS), Image.LANCZOS)
 
 
-def lockup(cap, color, background=None, size=None):
-    """Bolt + "Glint" (Geist SemiBold). `cap` is the wordmark's cap height in px."""
-    font = ImageFont.truetype(os.path.join(ROOT, "app", "vendor", "fonts", "Geist-SemiBold.ttf"), round(cap * SS / 0.71))
-    text = "Glint"
-    l, t, r, b = font.getbbox(text)
-    tw, th = r - l, b - t
-    bh = cap * SS * 1.8
+def lockup(text_h, color, background=None, size=None):
+    """Bolt + "Glint" with the lettering `text_h` px tall."""
+    global WORDMARK
+    if WORDMARK is None:
+        WORDMARK = wordmark_mask()
+    th = text_h * SS
+    tw = th * WORDMARK.width / WORDMARK.height
+    bh = th * LOCK_BOLT
     bw = bh * BOLT_W / BOLT_H
-    gap = cap * SS * 0.45
-    content_w, content_h = bw + gap + tw, max(bh, th)
-    pad = cap * SS * 0.25
+    gap = th * LOCK_GAP
+    top = -th * LOCK_RISE                 # bolt top, relative to the lettering's top
+    content_w = bw + gap + tw
+    content_top, content_bottom = min(top, 0), max(top + bh, th)
+    content_h = content_bottom - content_top
     if size:
         W, H = size[0] * SS, size[1] * SS
     else:
+        pad = th * 0.12
         W, H = round(content_w + 2 * pad), round(content_h + 2 * pad)
     img = Image.new("RGBA", (W, H), (background + (255,)) if background else (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
     x0 = (W - content_w) / 2
-    cy = H / 2
-    d.polygon(bolt_points(x0 + bw / 2, cy, bh), fill=color + (255,))
-    d.text((x0 + bw + gap - l, cy - th / 2 - t), text, font=font, fill=color + (255,))
+    text_top = (H - content_h) / 2 - content_top
+    ImageDraw.Draw(img).polygon(bolt_points(x0, text_top + top, bh), fill=color + (255,))
+    letters = WORDMARK.resize((round(tw), round(th)), Image.LANCZOS)
+    img.paste(Image.new("RGBA", letters.size, color + (255,)), (round(x0 + bw + gap), round(text_top)), letters)
     return img.resize((W // SS, H // SS), Image.LANCZOS)
 
 
@@ -90,13 +126,13 @@ def svg_path(scale=1.0, dx=0.0, dy=0.0):
 
 
 def write_svgs():
-    for name, color in (("black", "#0A0A0A"), ("white", "#FFFFFF")):
+    for name, color in (("black", "#000000"), ("white", "#FFFFFF")):
         with open(out("docs", "brand", f"glint-mark-{name}.svg"), "w", encoding="utf-8") as f:
             f.write(f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {BOLT_W} {BOLT_H}">'
                     f'<path d="{svg_path()}" fill="{color}"/></svg>\n')
     s = BOLT_SHARE * 100 / BOLT_H
     path = svg_path(s, 50 - BOLT_W * s / 2, 50 - BOLT_H * s / 2)
-    for name, bg, fg in (("dark", "#0A0A0A", "#FFFFFF"), ("light", "#FFFFFF", "#0A0A0A")):
+    for name, bg, fg in (("dark", "#000000", "#FFFFFF"), ("light", "#FFFFFF", "#000000")):
         with open(out("docs", "brand", f"glint-icon-{name}.svg"), "w", encoding="utf-8") as f:
             f.write('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">'
                     f'<rect width="100" height="100" rx="{RADIUS * 100:g}" fill="{bg}"/>'
@@ -108,11 +144,12 @@ def main():
     for dark in (True, False):
         name = "dark" if dark else "light"
         icon(1024, dark).save(out("docs", "brand", f"glint-icon-{name}.png"))
-    mark(512, BLACK).save(out("docs", "brand", "glint-mark-black.png"))
-    mark(512, WHITE).save(out("docs", "brand", "glint-mark-white.png"))
-    # README header: dark text for GitHub's light theme, white for its dark theme.
-    lockup(64, BLACK).save(out("docs", "brand", "glint-logo-light.png"))
-    lockup(64, WHITE).save(out("docs", "brand", "glint-logo-dark.png"))
+    mark(1024, BLACK).save(out("docs", "brand", "glint-mark-black.png"))
+    mark(1024, WHITE).save(out("docs", "brand", "glint-mark-white.png"))
+    # README header (about 4x its shown size): black for GitHub's light theme,
+    # white for its dark theme.
+    lockup(240, BLACK).save(out("docs", "brand", "glint-logo-light.png"))
+    lockup(240, WHITE).save(out("docs", "brand", "glint-logo-dark.png"))
 
     # Windows icon: the dark tile shows on both taskbar themes. Below 48 px the
     # bolt gets thicker so it does not thin out to a scratch.
@@ -120,7 +157,7 @@ def main():
     frames = [icon(s, True, bold=0.05 if s <= 24 else 0.03 if s <= 40 else 0.0) for s in sizes]
     frames[-1].save(out("app", "res", "glint.ico"), sizes=[(s, s) for s in sizes], append_images=frames[:-1])
 
-    lockup(92, WHITE, background=BLACK, size=(960, 400)).convert("RGB").save(out("payload", "assets", "banner.png"), optimize=True)
+    lockup(118, WHITE, background=BLACK, size=(960, 400)).convert("RGB").save(out("payload", "assets", "banner.png"), optimize=True)
 
 
 if __name__ == "__main__":
