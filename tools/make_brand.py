@@ -150,6 +150,14 @@ def main():
     # white for its dark theme.
     lockup(240, BLACK).save(out("docs", "brand", "glint-logo-light.png"))
     lockup(240, WHITE).save(out("docs", "brand", "glint-logo-dark.png"))
+    # README header: white on its own rounded black tile, so it reads the same
+    # whatever GitHub's theme is (a <picture> follows the device, not GitHub).
+    w, h = 1600, 560
+    banner = lockup(190, WHITE, background=BLACK, size=(w, h))
+    corners = Image.new("L", (w * SS, h * SS), 0)
+    ImageDraw.Draw(corners).rounded_rectangle([0, 0, w * SS - 1, h * SS - 1], radius=0.16 * h * SS, fill=255)
+    banner.putalpha(corners.resize((w, h), Image.LANCZOS))
+    banner.save(out("docs", "brand", "glint-banner.png"), optimize=True)
 
     # Windows icon: the dark tile shows on both taskbar themes. Below 48 px the
     # bolt gets thicker so it does not thin out to a scratch.

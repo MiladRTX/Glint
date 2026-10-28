@@ -1,9 +1,6 @@
 ﻿<div align="center">
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/brand/glint-logo-dark.png">
-  <img alt="Glint" src="docs/brand/glint-logo-light.png" width="300">
-</picture>
+<img alt="Glint" src="docs/brand/glint-banner.png" width="420">
 
 **Watch, hear and record a jailbroken PS5 on your Windows PC, with low latency.**
 
@@ -58,10 +55,6 @@ No capture card needed. A browser can also open the payload directly.
   screenshots, console recordings, dark and light theme. Nothing to install.
 - On-screen notifications on the console when it loads, is ready, or hits a
   problem.
-
-> [!NOTE]
-> Live streaming to Twitch, YouTube and TikTok is **switched off** in this
-> release. The code is kept in `app/src/stream/` behind `SL_LIVE_STREAMING`.
 
 ## Requirements
 
@@ -246,7 +239,6 @@ in [docs/CAPTURE-INTERNALS.md](docs/CAPTURE-INTERNALS.md).
 app/                  Windows app (C++17: GLFW, Vulkan, Dear ImGui, FFmpeg, SDL2, curl)
 ├── src/core/         payload session, HTTP client, settings, log
 ├── src/media/        decoder, audio, recorder, player, screenshots, gallery
-├── src/stream/       live streaming engine (switched off in 1.0)
 ├── src/shaders/      YUV → RGBA compute shader
 ├── res/              exe icon and version info
 ├── tools/            probe.cpp (headless test client), embed_fonts.js
