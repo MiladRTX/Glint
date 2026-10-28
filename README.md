@@ -205,9 +205,7 @@ Settings live in `%LOCALAPPDATA%\Glint`. Recordings and screenshots go to
 `%USERPROFILE%\Videos\Glint` by default. You can change the folder in
 Settings → Capture. All options: [app/README.md](app/README.md).
 
-> [!WARNING]
-> **Stop capture** (in Settings or the browser dashboard) can crash the
-> console. Use it only when you have to.
+
 
 ## How it works
 
