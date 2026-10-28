@@ -26,6 +26,10 @@ the picture and sound over a simple HTTP API. The Windows app connects to it,
 decodes on the GPU and shows the console in a window, at 1080p60, with sound.
 No capture card needed. A browser can also open the payload directly.
 
+<p align="center">
+  <img src="docs/media/glint-demo.webp" alt="Glint in action: live PS5 picture, latency switch, settings in dark and light, gallery and the built-in viewer" width="100%">
+</p>
+
 ## Features
 
 **Desktop app**
@@ -252,7 +256,7 @@ payload/              PS5 payload (C11)
 └── build/            glint-payload.elf and the host build (output)
 tests/                mock payload, protocol smoke test, probe runner
 tools/                gen_blobs.js (embeds the web assets), make_brand.py (icons and logos)
-docs/                 build, API, console and internals docs
+docs/                 build, API, console and internals docs; media/ holds the demo
 └── brand/            logo and icons; source/ holds the original designs
 ```
 
