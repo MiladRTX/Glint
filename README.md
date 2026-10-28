@@ -27,7 +27,7 @@ decodes on the GPU and shows the console in a window, at 1080p60, with sound.
 No capture card needed. A browser can also open the payload directly.
 
 <p align="center">
-  <img src="docs/media/glint-demo.webp" alt="Glint in action: live PS5 picture, latency switch, settings in dark and light, gallery and the built-in viewer" width="100%">
+  <img src="docs/media/glint-demo.gif" alt="Glint in action: live PS5 picture, latency switch, settings in dark and light, gallery and the built-in viewer" width="100%">
 </p>
 
 ## Features
