@@ -75,10 +75,11 @@ No capture card needed. A browser can also open the payload directly.
 
 ### 1. Get the files
 
-Build them yourself ([Building](#building)), or take a release build:
+Download both from the [latest release](https://github.com/MiladRTX/Glint/releases/latest),
+or build them yourself ([Building](#building)):
 
-- `Glint.exe`, the Windows app
-- `glint-payload.elf`, the PS5 payload
+- `Glint.exe`, the Windows app (one file, nothing to install)
+- `Glint-1.0-ps5.elf`, the PS5 payload
 
 ### 2. Run the payload
 
@@ -86,8 +87,11 @@ Upload the ELF to Payload Manager's folder on the console (FTP on port 2121
 here; use your console's IP):
 
 ```bash
-curl --ftp-create-dirs -T glint-payload.elf ftp://<ps5-ip>:2121/data/pldmgr/payloads/local/glint/Glint-1.0-ps5.elf
+curl --ftp-create-dirs -T Glint-1.0-ps5.elf ftp://<ps5-ip>:2121/data/pldmgr/payloads/local/glint/Glint-1.0-ps5.elf
 ```
+
+A self-built ELF is `payload/build/glint-payload.elf`; upload it under the same
+name.
 
 Then start **Glint** from Payload Manager on the console. You will see
 *"Glint 1.0 loaded. Starting capture..."*, then *"Glint ready on
