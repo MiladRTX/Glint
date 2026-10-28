@@ -26,6 +26,13 @@ the picture and sound over a simple HTTP API. The Windows app connects to it,
 decodes on the GPU and shows the console in a window, at 1080p60, with sound.
 No capture card needed. A browser can also open the payload directly.
 
+> [!IMPORTANT]
+> Glint has only been tested on **firmware 13.60**, so that's where it runs
+> most stable for now. Other firmwares may freeze or misbehave. It's still
+> early and being tested, so expect some rough edges. If something breaks,
+> please [open an issue](https://github.com/MiladRTX/Glint/issues) with your
+> firmware and the logs.
+
 <p align="center">
   <img src="docs/media/glint-demo.gif" alt="Glint in action: live PS5 picture, latency switch, settings in dark and light, gallery and the built-in viewer" width="100%">
 </p>
@@ -64,7 +71,7 @@ No capture card needed. A browser can also open the payload directly.
 
 | | |
 |---|---|
-| **Console** | Jailbroken PS5 with [Payload Manager](#2-run-the-payload) and an FTP server (tested on firmware `0x12600006`) |
+| **Console** | Jailbroken PS5 with [Payload Manager](#2-run-the-payload) and an FTP server (tested on firmware 13.60) |
 | **PC** | Windows 10 or 11, 64-bit, with a Vulkan-capable graphics driver |
 | **Network** | PC and PS5 on the same network. Wired is best; Wi-Fi works, with more jitter. |
 
