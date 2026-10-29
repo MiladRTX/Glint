@@ -34,18 +34,13 @@ No capture card needed. A browser can also open the payload directly.
 > firmware and the logs.
 
 > [!WARNING]
-> **Glint only works while the PS5 outputs 60 Hz.** When a game switches the
-> console to 120 Hz, the PS5's encoder stops and won't start again until the
-> PS5 restarts.
+> **Glint only works in 60 Hz mode.** If a game switches the PS5 to 120 Hz,
+> capture stops until you restart the console.
 >
-> To avoid that, Glint sets **Settings → Screen and Video → Video Output →
-> 120 Hz Output** to **Off** when it starts, and puts your setting back when
-> you stop Glint. While Glint runs, games play at 60 Hz.
->
-> **Start Glint from the home screen, before you start a game.** A game that
-> is already running at 120 Hz stays there until you close it.
->
-> I'm working on a way to make Glint work in 120 Hz mode too.
+> - Glint turns **120 Hz Output** off while it runs and puts your setting
+>   back when you stop it.
+> - **Load Glint from the home screen, before you start a game.**
+> - A fix for 120 Hz mode is in the works.
 
 <p align="center">
   <img src="docs/media/glint-demo.gif" alt="Glint in action: live PS5 picture, latency switch, settings in dark and light, gallery and the built-in viewer" width="100%">
