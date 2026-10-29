@@ -319,3 +319,7 @@ GLFW (permissive).
 Glint is a homebrew project for consoles you own. It is not affiliated
 with or endorsed by Sony Interactive Entertainment. "PlayStation" and "PS5"
 are trademarks of Sony Interactive Entertainment Inc.
+
+## Credits
+
+The PS5 capture approach in Glint was learned by studying [PBS Studio](https://github.com/seregonwar) by seregonwar.
