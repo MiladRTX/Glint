@@ -1,9 +1,9 @@
 # Changelog
 
 
-## [1.5] - 2026-10-29
+## [1.1] - 2026-10-29
 
-Upload the payload as `/data/pldmgr/payloads/local/glint/Glint-1.5-ps5.elf`.
+Upload the payload as `/data/pldmgr/payloads/local/glint/Glint-1.1-ps5.elf`.
 
 ### Desktop app (Windows)
 

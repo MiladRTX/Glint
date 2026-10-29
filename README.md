@@ -4,7 +4,7 @@
 
 **Watch, hear and record a jailbroken PS5 on your Windows PC, with low latency.**
 
-![Version](https://img.shields.io/badge/version-1.5-informational)
+![Version](https://img.shields.io/badge/version-1.1-informational)
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078D6)
 ![Console](https://img.shields.io/badge/console-PS5%20(jailbroken)-003791)
 ![Language](https://img.shields.io/badge/C%2B%2B17%20%2B%20C11-00599C)
@@ -91,7 +91,7 @@ Download both from the [latest release](https://github.com/MiladRTX/Glint/releas
 or build them yourself ([Building](#building)):
 
 - `Glint.exe`, the Windows app (one file, nothing to install)
-- `Glint-1.5-ps5.elf`, the PS5 payload
+- `Glint-1.1-ps5.elf`, the PS5 payload
 
 ### 2. Run the payload
 
@@ -99,14 +99,14 @@ Upload the ELF to Payload Manager's folder on the console (FTP on port 2121
 here; use your console's IP):
 
 ```bash
-curl --ftp-create-dirs -T Glint-1.5-ps5.elf ftp://<ps5-ip>:2121/data/pldmgr/payloads/local/glint/Glint-1.5-ps5.elf
+curl --ftp-create-dirs -T Glint-1.1-ps5.elf ftp://<ps5-ip>:2121/data/pldmgr/payloads/local/glint/Glint-1.1-ps5.elf
 ```
 
 A self-built ELF is `payload/build/glint-payload.elf`; upload it under the same
 name.
 
 Then start **Glint** from Payload Manager on the console. You will see
-*"Glint 1.5 loaded. Starting capture..."*, then *"Glint ready on
+*"Glint 1.1 loaded. Starting capture..."*, then *"Glint ready on
 port 7231"*.
 
 > [!TIP]
