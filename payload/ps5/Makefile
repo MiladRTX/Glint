@@ -10,6 +10,8 @@ ELF := $(OUT)/glint-payload.elf
 
 CFLAGS := -O2 -g -std=c11 -Wall -Wextra -Wno-unused-parameter -DSL_PS5 \
           -I../include -I../src
+# The 120 Hz Output setting (main.c).
+LDLIBS := -lSceRegMgr
 
 SRC := \
   ../src/state.c \
@@ -34,19 +36,19 @@ all: $(ELF) $(OUT)/glint-payload-test.elf
 
 $(ELF): $(SRC) ../include/glint.h ../src/http_handlers.h
 	@mkdir -p $(OUT)
-	$(CC) $(CFLAGS) -o $@ $(SRC)
+	$(CC) $(CFLAGS) -o $@ $(SRC) $(LDLIBS)
 
 $(OUT)/glint-payload-test.elf: $(SRC_TEST) ../include/glint.h ../src/http_handlers.h
 	@mkdir -p $(OUT)
-	$(CC) $(CFLAGS) -DSL_TEST_CAPTURE -o $@ $(SRC_TEST)
+	$(CC) $(CFLAGS) -DSL_TEST_CAPTURE -o $@ $(SRC_TEST) $(LDLIBS)
 
 $(OUT)/glint-stall-test.elf: $(SRC) ../include/glint.h ../src/http_handlers.h
 	@mkdir -p $(OUT)
-	$(CC) $(CFLAGS) -DSL_FORCE_STALL -o $@ $(SRC)
+	$(CC) $(CFLAGS) -DSL_FORCE_STALL -o $@ $(SRC) $(LDLIBS)
 
 $(OUT)/glint-reset-ra.elf: $(SRC) ../include/glint.h ../src/http_handlers.h
 	@mkdir -p $(OUT)
-	$(CC) $(CFLAGS) -DSL_RESET_RA -o $@ $(SRC)
+	$(CC) $(CFLAGS) -DSL_RESET_RA -o $@ $(SRC) $(LDLIBS)
 
 clean:
 	rm -f $(ELF) $(OUT)/glint-payload-test.elf $(OUT)/glint-stall-test.elf $(OUT)/glint-reset-ra.elf

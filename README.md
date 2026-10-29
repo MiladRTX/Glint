@@ -4,7 +4,7 @@
 
 **Watch, hear and record a jailbroken PS5 on your Windows PC, with low latency.**
 
-![Version](https://img.shields.io/badge/version-1.1-informational)
+![Version](https://img.shields.io/badge/version-1.2-informational)
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078D6)
 ![Console](https://img.shields.io/badge/console-PS5%20(jailbroken)-003791)
 ![Language](https://img.shields.io/badge/C%2B%2B17%20%2B%20C11-00599C)
@@ -32,6 +32,20 @@ No capture card needed. A browser can also open the payload directly.
 > early and being tested, so expect some rough edges. If something breaks,
 > please [open an issue](https://github.com/MiladRTX/Glint/issues) with your
 > firmware and the logs.
+
+> [!WARNING]
+> **Glint only works while the PS5 outputs 60 Hz.** When a game switches the
+> console to 120 Hz, the PS5's encoder stops and won't start again until the
+> PS5 restarts.
+>
+> To avoid that, Glint sets **Settings → Screen and Video → Video Output →
+> 120 Hz Output** to **Off** when it starts, and puts your setting back when
+> you stop Glint. While Glint runs, games play at 60 Hz.
+>
+> **Start Glint from the home screen, before you start a game.** A game that
+> is already running at 120 Hz stays there until you close it.
+>
+> I'm working on a way to make Glint work in 120 Hz mode too.
 
 <p align="center">
   <img src="docs/media/glint-demo.gif" alt="Glint in action: live PS5 picture, latency switch, settings in dark and light, gallery and the built-in viewer" width="100%">
@@ -91,7 +105,7 @@ Download both from the [latest release](https://github.com/MiladRTX/Glint/releas
 or build them yourself ([Building](#building)):
 
 - `Glint.exe`, the Windows app (one file, nothing to install)
-- `Glint-1.1-ps5.elf`, the PS5 payload
+- `Glint-1.2-ps5.elf`, the PS5 payload
 
 ### 2. Run the payload
 
@@ -99,20 +113,20 @@ Upload the ELF to Payload Manager's folder on the console (FTP on port 2121
 here; use your console's IP):
 
 ```bash
-curl --ftp-create-dirs -T Glint-1.1-ps5.elf ftp://<ps5-ip>:2121/data/pldmgr/payloads/local/glint/Glint-1.1-ps5.elf
+curl --ftp-create-dirs -T Glint-1.2-ps5.elf ftp://<ps5-ip>:2121/data/pldmgr/payloads/local/glint/Glint-1.2-ps5.elf
 ```
 
 A self-built ELF is `payload/build/glint-payload.elf`; upload it under the same
 name.
 
 Then start **Glint** from Payload Manager on the console. You will see
-*"Glint 1.1 loaded. Starting capture..."*, then *"Glint ready on
+*"Glint 1.2 loaded. Starting capture..."*, then *"Glint ready on
 port 7231"*.
 
 > [!TIP]
-> Payload Manager expects names shaped like `Name-version-ps5.elf`. If the
-> console says *"the PS5 refused to start video capture"*, just run it again.
-> This often happens on the first try after the PS5 starts.
+> Payload Manager expects names shaped like `Name-version-ps5.elf`. Load
+> Glint from the home screen, before you start a game (see the 60 Hz note at
+> the top).
 
 ### 3. Connect
 
@@ -291,7 +305,8 @@ docs/                 build, API, console and internals docs; media/ holds the d
 | Problem | Try |
 |---|---|
 | App can't connect | Check that the payload is running (its notification shows on the console) and that the address uses port `7231`. |
-| "The PS5 refused to start video capture" | The encoder needs a minute between sessions. Wait, then run the payload again. |
+| "The PS5 refused to start video capture" | Glint already retries a few times on its own. If it still says this, load it again. |
+| "The PS5 switched to 120 Hz output" | A game turned on 120 Hz. Set 120 Hz Output to **Off**, restart the PS5, and load Glint before starting the game. |
 | Picture stutters on Wi-Fi | Switch latency to **Balanced** (`L`), or use a cable. |
 | Smeared or frozen picture | Settings → Console → **Request keyframe**. |
 | Upload looks fine but the payload won't start | Download the ELF back over FTP and compare its SHA-256. An interrupted upload leaves a truncated file. |

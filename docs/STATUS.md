@@ -46,7 +46,7 @@ minute between sessions before it will start again.
 - **Built-in viewer** for the gallery: recordings play with sound, seek and
   volume; screenshots zoom and pan. `--view <file>` opens one directly.
 - **One file, no console window**: static exe built as a Windows app; version
-  1.1 (app and payload).
+  1.2 (app and payload).
 - **Video page**: GPU/CPU decode, GPU/CPU colour conversion, Latency, graphics
   info. The top chip shows the fps and Mbit/s actually received over the last 2 s.
 

@@ -287,6 +287,14 @@ static int g_run_count;             /* completed runs; a run after the first is 
 static int g_restart_pending;       /* restart taken by the live loop, serviced by the next run */
 static int g_need_terminate;        /* SetCallback reported a stale session (0x819b0007) */
 static volatile int g_encoder_locked; /* set once; no retries after this, reboot required */
+/* GetVideoOutMode's answer: 0x10 at the usual 60 Hz output. A game that
+ * switches the console to 120 Hz output (Settings > Screen and Video >
+ * 120 Hz Output on Auto/On) changes it (0x0 while switching, 0x40 after),
+ * and the encoder then refuses to reopen. */
+#define SL_VIDEO_MODE_USUAL 0x10u
+static uint32_t g_last_video_mode = SL_VIDEO_MODE_USUAL;
+#define SL_START_RETRIES 3
+static int g_start_retries;         /* Start refusals before the first frame (see capture_session) */
 
 static void encoder_locked(const char *where)
 {
@@ -294,9 +302,14 @@ static void encoder_locked(const char *where)
     g_encoder_locked = 1;
     /* The encoder-locked state does not reliably clear across a payload
      * restart, so we don't claim it will. */
-    cap_log("encoder refused to start (%s)\n", where);
-    if (first) sl_notify(1, "Glint: the PS5 refused to start video capture (0x%08x). Load Glint again.",
-                        (unsigned)SL_SCE_START_LOCKED);
+    cap_log("encoder refused to start (%s, video-out mode 0x%x)\n", where, g_last_video_mode);
+    if (!first) return;
+    if (g_last_video_mode != SL_VIDEO_MODE_USUAL)
+        sl_notify(1, "Glint: the PS5 switched to 120 Hz output, which Glint can't capture. Set Screen "
+                     "and Video > Video Output > 120 Hz Output to Off, then restart the PS5.");
+    else
+        sl_notify(1, "Glint: the PS5 refused to start video capture (0x%08x). Load Glint again.",
+                  (unsigned)SL_SCE_START_LOCKED);
 }
 
 
@@ -419,6 +432,7 @@ static void capture_session(void)
     sl_inject_read_at(&ctx, out, &video_mode, sizeof(video_mode));
     cap_log("remote GetVideoOutMode rc=0x%llx mode=0x%x stage=%s\n",
             (unsigned long long)rc, video_mode, ctx.stage);
+    g_last_video_mode = video_mode;
 
     /* 1080p.
      * Each attempt: Initialize, SetCallback(id), ChangeState(id, RUNNING),
@@ -609,8 +623,17 @@ attempt_failed:
     rc = sl_inject_call_fast(&ctx, start, start_args);
     log_call("Start()", rc);
     if ((uint32_t)rc == SL_SCE_START_LOCKED) {
-        /* The encoder is locked in a state only a reboot clears: don't retry,
-         * don't try a remote Close (which may hang), just log and stop. */
+        /* The first Start after a boot is refused like this, and the same
+         * steps work a moment later (loading Glint a second time always
+         * did). So the first runs get another go; only after that is it
+         * the lock only a reboot clears. No remote Close (it may hang). */
+        if (g_run_count == 0 && g_start_retries < SL_START_RETRIES &&
+            g_last_video_mode == SL_VIDEO_MODE_USUAL) {
+            g_start_retries++;
+            cap_log("Start refused before the first frame; trying again (%d of %d)\n",
+                    g_start_retries, SL_START_RETRIES);
+            goto done;
+        }
         encoder_locked("Start");
         goto done;
     }

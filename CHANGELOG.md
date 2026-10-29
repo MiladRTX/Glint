@@ -1,5 +1,27 @@
 # Changelog
 
+## [1.2] - 2026-10-29
+
+Upload the payload as `/data/pldmgr/payloads/local/glint/Glint-1.2-ps5.elf`.
+
+> **Glint only works while the PS5 outputs 60 Hz.** When a game switches the
+> console to 120 Hz, the encoder stops until the PS5 restarts. Glint now turns
+> **120 Hz Output** off while it runs and puts your setting back when it
+> stops. **Start Glint from the home screen, before you start a game.** I'm
+> working on a way to make it work in 120 Hz mode too.
+
+### Payload (PS5)
+
+- **120 Hz Output off while Glint runs:** Glint sets Settings → Screen and
+  Video → Video Output → 120 Hz Output to Off when it starts and restores it
+  when it stops. If Glint is closed from Payload Manager, the setting is put
+  back the next time Glint stops normally.
+- **Starts on the first try after a restart:** the encoder refuses the first
+  start after the PS5 boots; Glint now tries again by itself (up to 3 times)
+  instead of asking you to load it again.
+- When a game has switched the console to 120 Hz, the console message says
+  so and what to do, instead of a generic "refused to start".
+
 
 ## [1.1] - 2026-10-29
 

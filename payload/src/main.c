@@ -24,6 +24,50 @@ static volatile int g_quit = 0;
 /* The name in the console's process list (Payload Manager shows "payload.elf"
  * otherwise). Weak: a firmware without it still loads Glint. */
 int sceKernelSetProcessName(const char *name) __attribute__((weak));
+
+/* "120 Hz Output" (Settings > Screen and Video > Video Output) is the
+ * registry entry VIDEOOUT_hfr: 0 = Auto/On, 1 = Off. A game that switches
+ * the console to 120 Hz stops the capture for good, so Glint turns it Off
+ * while it runs and puts it back when it stops. The original value is kept
+ * in a file too, so a Glint that was killed is undone by the next clean stop. */
+int sceRegMgrGetInt(long key, int *val) __attribute__((weak));
+int sceRegMgrSetInt(long key, int val) __attribute__((weak));
+#define SL_REG_VIDEOOUT_HFR 0x0a240000L
+#define SL_HFR_OFF          1
+#define SL_HFR_RESTORE_FILE "/data/glint/hfr_restore"
+
+static int hfr_saved_read(int *value)
+{
+    FILE *f = fopen(SL_HFR_RESTORE_FILE, "r");
+    if (!f) return -1;
+    int ok = fscanf(f, "%d", value) == 1;
+    fclose(f);
+    return ok ? 0 : -1;
+}
+
+static void hfr_off(void)
+{
+    if (!sceRegMgrGetInt || !sceRegMgrSetInt) return;
+    int value = -1;
+    if (sceRegMgrGetInt(SL_REG_VIDEOOUT_HFR, &value) != 0 || value == SL_HFR_OFF) return;
+    int saved;
+    if (hfr_saved_read(&saved) != 0) {
+        FILE *f = fopen(SL_HFR_RESTORE_FILE, "w");
+        if (f) { fprintf(f, "%d\n", value); fclose(f); }
+    }
+    if (sceRegMgrSetInt(SL_REG_VIDEOOUT_HFR, SL_HFR_OFF) == 0)
+        sl_notify(0, "Glint turned 120 Hz Output off while it runs. It comes back when Glint stops.");
+}
+
+static void hfr_restore(void)
+{
+    int saved;
+    if (!sceRegMgrSetInt || hfr_saved_read(&saved) != 0) return;
+    if (sceRegMgrSetInt(SL_REG_VIDEOOUT_HFR, saved) == 0) remove(SL_HFR_RESTORE_FILE);
+}
+#else
+static void hfr_off(void) {}
+static void hfr_restore(void) {}
 #endif
 
 static void on_signal(int sig)
@@ -101,9 +145,11 @@ int main(int argc, char **argv)
 #endif
 
     sl_notify(0, "Glint " SL_VERSION " loaded. Starting capture...");
+    hfr_off();
     if (sl_capture_start() != 0) {
         fprintf(stderr, "Glint: capture unavailable\n");
         sl_notify(1, "Glint: capture is not available on this console.");
+        hfr_restore();
         return 1;
     }
 
@@ -125,6 +171,7 @@ int main(int argc, char **argv)
     sl_capture_stop();
     sl_server_stop();
     sl_server_wait();
+    hfr_restore();
     if (served) sl_notify(0, "Glint stopped.");
     else if (!sl_error_notified())
         sl_notify(1, "Glint could not start capture. See /data/glint/capture.log");

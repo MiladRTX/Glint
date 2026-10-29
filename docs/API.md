@@ -111,7 +111,7 @@ float samples).
 
 ```json
 {
-  "version": "1.1",
+  "version": "1.2",
   "backend": "h264",
   "width": 1920,
   "height": 1080,
