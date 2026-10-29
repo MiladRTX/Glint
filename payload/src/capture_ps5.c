@@ -295,7 +295,7 @@ static void encoder_locked(const char *where)
     /* The encoder-locked state does not reliably clear across a payload
      * restart, so we don't claim it will. */
     cap_log("encoder refused to start (%s)\n", where);
-    if (first) sl_notify(1, "Glint: the PS5 refused to start video capture (0x%08x). Wait a minute, then load Glint again.",
+    if (first) sl_notify(1, "Glint: the PS5 refused to start video capture (0x%08x). Load Glint again.",
                         (unsigned)SL_SCE_START_LOCKED);
 }
 
@@ -752,6 +752,11 @@ attempt_failed:
             sl_inject_call_fast(&ctx, request_key, k);
         }
 
+        /* The bitrate is set once, before Start. Changing it on a running
+         * session (SetVideoBitrate returns ok) makes every ReadVideo after it
+         * fail with 0x80c78000 and locks the encoder until a reboot; a clean
+         * close and reopen is refused at Start too. One session per boot. */
+
         uint64_t rv_args[6] = { session, (uint64_t)frame_buf, 0x100000, (uint64_t)meta_at, 0 };
         int64_t size = sl_inject_call_fast(&ctx, read_video, rv_args);
 #ifdef SL_FORCE_STALL
@@ -896,6 +901,9 @@ static void *capture_main(void *arg)
 {
     (void)arg;
     mkdir("/data/glint", 0777);
+    /* Keep the previous run's log: when Glint is started again after a
+     * problem, that log is the one that explains it. */
+    rename("/data/glint/capture.log", "/data/glint/capture.prev.log");
     g_cap_log = fopen("/data/glint/capture.log", "w");
     cap_log("Glint " SL_VERSION " capture start\n");
 
@@ -1041,6 +1049,11 @@ static void *capture_main(void *arg)
     if (av.fn_close) av.fn_close(handle);
     if (av.fn_terminate) av.fn_terminate();
     return NULL;
+}
+
+int sl_capture_failed(void)
+{
+    return g_encoder_locked;
 }
 
 int sl_capture_start(void)

@@ -130,6 +130,9 @@
   .b.outline:hover{background:var(--raised)}
   .b.danger{border:0;background:var(--live);color:#fff}
   .b.danger:hover{filter:brightness(.92)}
+  .b.primary{border:0;background:var(--primary);color:var(--on-primary)}
+  .b.primary:hover{background:var(--primary-hover)}
+  #takeover{margin-top:18px;pointer-events:auto}
 
   .toast{position:fixed;left:50%;bottom:96px;transform:translate(-50%,10px);padding:10px 16px;border-radius:12px;background:var(--raised);border:1px solid var(--line);box-shadow:0 8px 24px var(--shadow);opacity:0;pointer-events:none;transition:opacity .22s,transform .3s cubic-bezier(.22,1,.36,1);white-space:nowrap}
   .toast.show{opacity:1;transform:translate(-50%,0)}
@@ -155,6 +158,7 @@
       <h1 id="msgtitle">Connecting to your PS5</h1>
       <p id="msgtext">Talking to the Glint payload.</p>
       <div class="dots" id="dots" aria-hidden="true"><i></i><i></i><i></i></div>
+      <button class="b primary" id="takeover" hidden>Watch here</button>
     </div>
   </div>
 
@@ -165,7 +169,6 @@
       <span class="muted" id="state">Connecting</span>
       <span id="strip" title="Last second of frames. Taller amber bars arrived late." aria-hidden="true"></span>
       <span class="mono muted" id="rate"></span>
-      <span class="muted" id="viewers" style="font-size:13px"></span>
     </section>
     <nav class="actions" aria-label="Page">
       <button class="round glass" id="files" aria-label="Console recordings" title="Console recordings">
@@ -258,7 +261,15 @@ function toast(t){ const el=$("#toast"); el.textContent=t; el.classList.add("sho
 function waiting(title, text, busy){
   document.body.classList.add("waiting");
   $("#msgtitle").textContent=title; $("#msgtext").textContent=text; $("#dots").style.display=busy?"flex":"none";
+  $("#takeover").hidden=true;
 }
+
+// One viewer at a time: the console streams to the newest page (or Glint app)
+// and ends everyone else's stream. This page's id tells the console who it is.
+const VIEWER=Array.from(crypto.getRandomValues(new Uint8Array(8)),b=>b.toString(16).padStart(2,"0")).join("");
+let takeOver=false;
+class TakenOver extends Error {}
+function streamUrl(path){ return path+"?viewer="+VIEWER+(takeOver?"&take=1":""); }
 function setState(kind, text){
   statusEl.className="status glass "+kind; $("#state").textContent=text;
 }
@@ -348,6 +359,9 @@ function toAvcc(au){                                 // Annex-B AU -> length-pre
 
 // ---- live video over MSE ------------------------------------------------------
 let ms=null, sb=null, ops=[], busy=false, seq=0, dts=0, dur=1500, started=false, haveFrame=false, videoAbort=null;
+let keys=[], trimmed=0, lastAsk=-1e9;               // keyframe times (s), how far video was dropped
+let lags=[];                                        // recent lead of buffered video over playback (s)
+const TARGET_LAG=0.022;                             // ~1.3 frames: lower stalls on Wi-Fi bursts
 
 function enqueue(op){ ops.push(op); drain(); }
 function drain(){
@@ -355,7 +369,15 @@ function drain(){
   const op=ops.shift(); if(!op) return;
   busy=true;
   try{ if(op.t==="a") sb.appendBuffer(op.b); else sb.remove(op.s,op.e); }
-  catch(e){ busy=false; if(e.name==="QuotaExceededError"){ try{ const b=video.buffered; if(b.length) sb.remove(b.start(0), Math.max(b.start(0), video.currentTime-2)); }catch(_){} } }
+  catch(e){ busy=false; if(e.name==="QuotaExceededError"){ ops.unshift(op); const cut=keyBefore(video.currentTime-1); if(cut>trimmed){ trimmed=cut; try{ busy=true; sb.remove(0,cut); }catch(_){ busy=false; } } else askKey(); } }
+}
+
+// Newest keyframe at or before t. Video may only be dropped up to a keyframe:
+// removing the one a frame depends on drops every frame after it too.
+function keyBefore(t){ let k=-1; for(const x of keys) if(x<=t) k=x; return k; }
+function askKey(){
+  const now=performance.now(); if(now-lastAsk<3000) return; lastAsk=now;
+  fetch("/video/keyframe",{method:"POST"}).catch(()=>{});
 }
 
 async function startVideo(cfg){
@@ -366,7 +388,7 @@ async function startVideo(cfg){
   catch(e){ waiting("This browser can't play the stream","It cannot decode the console's H.264 picture. Use the Glint app for Windows.",false); return false; }
   sb.addEventListener("updateend",()=>{ busy=false; drain(); });
   sb.addEventListener("error",()=>{ busy=false; });
-  seq=0; dts=0; started=false; paceInit=false;
+  seq=0; dts=0; started=false; paceInit=false; keys=[]; trimmed=0; lags=[]; refill=false;
   dur=Math.round(TS/(cfg.fps||60));
   enqueue({t:"a", b:initSegment(hexToBytes(cfg.sps), hexToBytes(cfg.pps), cfg.width, cfg.height)});
   return true;
@@ -374,43 +396,81 @@ async function startVideo(cfg){
 
 function liveEdge(){
   const b=video.buffered; if(!b.length) return;
-  const end=b.end(b.length-1);
-  if(end-video.currentTime>2.0) video.currentTime=end-0.25;          // catch up to live
-  if(video.currentTime-b.start(0)>8) enqueue({t:"r", s:b.start(0), e:video.currentTime-4});
-  if(video.paused) video.play().catch(()=>{});
+  const ct=video.currentTime, lag=b.end(b.length-1)-ct, last=keys.length?keys[keys.length-1]:0;
+  // The server sends keyframes only on connect or on request (each is a latency
+  // spike on Wi-Fi), so ask for one now and then: old video can only go up to one.
+  // Every 10 s keeps the buffer near 12 s (~55 MB at 38 Mbit/s), well inside
+  // what browsers allow (phones and Safari allow much less than desktop Chrome).
+  if(ct-last>10) askKey();
+  if(lag>3){                                       // far behind (hidden tab, a stall)
+    if(last>ct+0.5) video.currentTime=last;        // jump to the newest keyframe
+    else askKey();
+  }
+  // Keep the smallest lead over the last half second near TARGET_LAG: play a
+  // little faster while there's more buffered, a little slower when it runs thin.
+  lags.push(lag); if(lags.length>60) lags.shift();
+  const low=Math.min(...lags);
+  const rate=Math.round(100*(1+Math.max(-0.03,Math.min(0.15,(low-TARGET_LAG)*2))))/100;
+  if(video.playbackRate!==rate) video.playbackRate=rate;
+  const cut=keyBefore(ct-2);
+  if(cut-trimmed>4){ enqueue({t:"r", s:0, e:cut}); trimmed=cut; keys=keys.filter(k=>k>=cut); }
+  // After running dry, let a little video build up before playing again: the
+  // browser would restart on the first frame and run dry once per frame
+  // through the rest of a Wi-Fi gap, a stutter instead of one short hitch.
+  if(refill && lag>=REFILL_LAG) refill=false;
+  if(video.paused && !refill) video.play().catch(()=>{});
 }
+let refill=false;
+const REFILL_LAG=0.045;
+video.addEventListener("waiting",()=>{ if(started && !refill){ refill=true; video.pause(); } });
 
-async function pumpFrames(signal){
-  const res=await fetch("/frames",{cache:"no-store",signal});
+// Reads [u32 len][u32 pts][payload] records off a stream and hands each one on as
+// soon as it is complete. Only a partial record is ever copied.
+async function readFramed(res,onRecord){
   const reader=res.body.getReader();
-  let buf=new Uint8Array(0);
-  const grow=(a,b)=>{ const n=new Uint8Array(a.length+b.length); n.set(a); n.set(b,a.length); return n; };
+  let buf=new Uint8Array(0), off=0;
   for(;;){
     const {value,done}=await reader.read();
-    if(done) break;
-    buf=grow(buf,value);
-    for(;;){
-      if(buf.length<8) break;
-      const dv=new DataView(buf.buffer,buf.byteOffset,8);
-      const len=dv.getUint32(0), pts=dv.getUint32(4);
-      if(buf.length<8+len) break;
-      const unit=buf.slice(8,8+len);
-      buf=buf.slice(8+len);
-      pace(pts);
-      const {data,idr,vcl}=toAvcc(unit);
-      if(!vcl) continue;
-      if(!started && !idr) continue;                 // begin on an IDR
-      started=true;
-      enqueue({t:"a", b:mediaSegment(data,idr,dts,dur,seq++)});
-      dts+=dur;
-      if(!haveFrame && video.videoWidth){ haveFrame=true; document.body.classList.remove("waiting"); wake(); }
-      liveEdge();
+    if(done) return;
+    if(off<buf.length){ const n=new Uint8Array(buf.length-off+value.length); n.set(buf.subarray(off)); n.set(value,buf.length-off); buf=n; }
+    else buf=value;
+    off=0;
+    while(buf.length-off>=8){
+      const dv=new DataView(buf.buffer,buf.byteOffset+off,8), len=dv.getUint32(0);
+      if(buf.length-off<8+len) break;
+      onRecord(buf.subarray(off+8,off+8+len),dv.getUint32(4));
+      off+=8+len;
     }
   }
 }
 
+async function pumpFrames(signal){
+  const res=await fetch(streamUrl("/frames"),{cache:"no-store",signal});
+  if(res.status===409) throw new TakenOver();
+  takeOver=false;
+  await readFramed(res,(unit,pts)=>{
+      pace(pts);
+      const {data,idr,vcl}=toAvcc(unit);
+      if(!vcl) return;
+      if(!started && !idr) return;                   // begin on an IDR
+      started=true;
+      if(idr) keys.push(dts/TS);
+      enqueue({t:"a", b:mediaSegment(data,idr,dts,dur,seq++)});
+      dts+=dur;
+      if(!haveFrame && video.videoWidth){ haveFrame=true; document.body.classList.remove("waiting"); wake(); }
+      liveEdge();
+  });
+}
+
 // ---- audio: scheduled Web Audio (no AudioWorklet; works over plain HTTP) -------
 let audioCtx=null, gain=null, audioOn=false, audioAbort=null, playHead=0, chans=2, rate=48000;
+let audioMuted=false, audioWaiting=false;          // turned off by the viewer; waiting for a click
+// Jitter buffer. Each chunk has an ideal arrival time (first chunk + samples so
+// far); how much later it really came is its lateness. Play each chunk at its
+// ideal time + the best lateness seen + the 95th percentile of the recent extra
+// lateness, so the buffer is just big enough for this network.
+let aBase=0, aSamples=0, aBest=0, aBestT=0, aJit=[], aTarget=0.05;
+const A_MIN=0.03, A_MAX=0.3;
 const volume=$("#volume");
 function showVolume(){ volume.style.setProperty("--fill",(volume.value/2)+"%"); if(gain) gain.gain.value=volume.value/100; }
 volume.oninput=showVolume; showVolume();
@@ -420,65 +480,82 @@ function audioIcon(on){
     : '<polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><line x1="22" x2="16" y1="9" y2="15"/><line x1="16" x2="22" y1="9" y2="15"/>';
   $("#audio").setAttribute("aria-pressed", on ? "true" : "false");
 }
-async function enableAudio(cfg){
+// Sound is on by default. Browsers only let a page play sound after the viewer
+// has clicked or pressed a key on it, so until then it waits for the first one.
+async function enableAudio(cfg,quiet){
   try{
     chans=(cfg.audio&&cfg.audio.channels)||2; rate=(cfg.audio&&cfg.audio.rate)||48000;
-    audioCtx=new (window.AudioContext||window.webkitAudioContext)({sampleRate:rate});
+    audioCtx=new (window.AudioContext||window.webkitAudioContext)({sampleRate:rate,latencyHint:"interactive"});
     gain=audioCtx.createGain(); gain.connect(audioCtx.destination); showVolume();
-    await audioCtx.resume();
-    playHead=audioCtx.currentTime+0.15;
+    audioOn=true; audioIcon(true);
+    const ctx=audioCtx;
+    ctx.resume().catch(()=>{});
+    await new Promise(r=>setTimeout(r,50));
+    if(ctx.state!=="running"){
+      audioWaiting=true;
+      if(!quiet) toast("Click anywhere for sound");
+      await new Promise(r=>{
+        const go=()=>ctx.resume().catch(()=>{});
+        addEventListener("pointerdown",go); addEventListener("keydown",go);
+        ctx.addEventListener("statechange",()=>{ if(ctx.state!=="suspended"){ removeEventListener("pointerdown",go); removeEventListener("keydown",go); r(); } });
+      });
+      setTimeout(()=>{ audioWaiting=false; },300);   // that click is not also a "sound off"
+    }
+    if(audioCtx!==ctx || ctx.state!=="running") return;
+    aSamples=0; playHead=0;
     audioAbort=new AbortController();
     pumpAudio(audioAbort.signal).catch(()=>{});
-    audioOn=true; audioIcon(true); toast("Sound on");
-  }catch(e){ toast("Sound is not available in this browser"); }
+    if(!quiet) toast("Sound on");
+  }catch(e){ audioOn=false; audioIcon(false); toast("Sound is not available in this browser"); }
 }
 function disableAudio(){ audioOn=false; audioIcon(false); if(audioAbort) audioAbort.abort(); if(audioCtx) audioCtx.close(); audioCtx=null; gain=null; }
 
 async function pumpAudio(signal){
-  const res=await fetch("/audio",{cache:"no-store",signal});
-  const reader=res.body.getReader();
-  let buf=new Uint8Array(0);
-  const grow=(a,b)=>{ const n=new Uint8Array(a.length+b.length); n.set(a); n.set(b,a.length); return n; };
-  for(;;){
-    const {value,done}=await reader.read();
-    if(done) break;
-    buf=grow(buf,value);
-    for(;;){
-      if(buf.length<8) break;
-      const dv=new DataView(buf.buffer,buf.byteOffset,8);
-      const len=dv.getUint32(0);
-      if(buf.length<8+len) break;
-      const pcm=new Float32Array(buf.slice(8,8+len).buffer);   // interleaved f32le
-      buf=buf.slice(8+len);
-      if(!audioCtx) continue;
-      const frames=pcm.length/chans;
-      const ab=audioCtx.createBuffer(chans, frames, rate);
-      for(let c=0;c<chans;c++){ const ch=ab.getChannelData(c); for(let i=0;i<frames;i++) ch[i]=pcm[i*chans+c]; }
-      const src=audioCtx.createBufferSource(); src.buffer=ab; src.connect(gain);
-      const now=audioCtx.currentTime;
-      if(playHead<now+0.02) playHead=now+0.08;       // underrun: nudge forward
-      if(playHead>now+0.5) playHead=now+0.25;        // drift: cap latency
-      src.start(playHead); playHead+=frames/rate;
-    }
-  }
+  const res=await fetch(streamUrl("/audio"),{cache:"no-store",signal});
+  if(res.status!==200) return;
+  await readFramed(res,unit=>{
+    if(!audioCtx) return;
+    const pcm=new Float32Array(unit.slice().buffer);  // interleaved f32le
+    const frames=pcm.length/chans, len=frames/rate;
+    const now=audioCtx.currentTime;
+    if(!aSamples){ aBase=now; aBest=0; aBestT=now; aJit=[]; }
+    const ideal=aBase+aSamples/rate, late=now-ideal;
+    aSamples+=frames;
+    aBest=Math.min(late,aBest+0.002*(now-aBestT)); aBestT=now;   // best case creeps 2 ms/s (clock drift)
+    aJit.push(late-aBest); if(aJit.length>235) aJit.shift();     // ~5 s of chunks
+    const s=[...aJit].sort((x,y)=>x-y);
+    aTarget=Math.max(A_MIN,Math.min(A_MAX,s[Math.floor(0.95*(s.length-1))]+0.01));
+    const want=ideal+aBest+aTarget;                  // when this chunk should start
+    if(playHead<now+0.002) playHead=Math.max(want,now+0.005);    // ran dry: restart on schedule
+    else if(want-playHead>0.025) playHead=want;      // too little queued: leave a short gap
+    else if(playHead-want>0.025) return;             // too much queued: skip this chunk (~21 ms)
+    const ab=audioCtx.createBuffer(chans, frames, rate);
+    for(let c=0;c<chans;c++){ const ch=ab.getChannelData(c); for(let i=0;i<frames;i++) ch[i]=pcm[i*chans+c]; }
+    const src=audioCtx.createBufferSource(); src.buffer=ab; src.connect(gain);
+    src.start(playHead); playHead+=len;
+  });
 }
 
 // ---- status + controls --------------------------------------------------------
 async function poll(){
   try{
     const s=await (await fetch("/status.json",{cache:"no-store"})).json();
-    if(s.frames>0) setState("live", s.height?`${s.height}p${Math.round(s.fps||60)}`:"Live");
+    if(elsewhere) setState("failed","Watching elsewhere");
+    else if(s.frames>0) setState("live", s.height?`${s.height}p${Math.round(s.fps||60)}`:"Live");
     else setState("connecting","Starting");
     $("#rate").textContent=((s.kbps||0)/1000).toFixed(1)+" Mbit/s";
-    $("#viewers").textContent=(s.clients||0)+" watching";
     const r=$("#rec"); r.classList.toggle("on",!!s.recording);
     $("#reclabel").textContent = s.recording ? clock(s.recording_seconds||0) : "Record on console";
     r.title = s.recording ? "Stop the console recording" : "Record on the console's storage";
-  }catch(e){ setState("failed","Can't reach the console"); $("#rate").textContent=""; $("#viewers").textContent=""; }
+  }catch(e){ setState("failed","Can't reach the console"); $("#rate").textContent=""; }
 }
 async function post(path){ try{ const r=await fetch(path,{method:"POST"}); return r.ok; }catch(e){ return false; } }
 
-$("#audio").onclick=async()=>{ if(audioOn) disableAudio(); else await enableAudio(window.__cfg||{}); };
+$("#audio").onclick=async()=>{
+  if(audioWaiting) return;                           // this click is what turns the sound on
+  if(audioOn){ audioMuted=true; disableAudio(); toast("Sound off"); }
+  else { audioMuted=false; await enableAudio(window.__cfg||{}); }
+};
 $("#snap").onclick=()=>{
   if(!video.videoWidth){ toast("No picture yet"); return; }
   const c=document.createElement("canvas"); c.width=video.videoWidth; c.height=video.videoHeight;
@@ -556,14 +633,41 @@ async function connect(){
   haveFrame=false; waiting("Waiting for the picture","Connected. The first keyframe usually arrives within a second or two.",true);
   if(!("MediaSource" in window)){ waiting("This browser can't play the stream","Use the Glint app for Windows, or a desktop browser.",false); return; }
   if(!await startVideo(cfg)) return;
+  if(!audioOn && !audioMuted) enableAudio(cfg);
   videoAbort=new AbortController();
-  pumpFrames(videoAbort.signal).catch(()=>{}).finally(()=>{
+  pumpFrames(videoAbort.signal).then(()=>null,e=>e).then(err=>{
     try{ videoAbort.abort(); if(ms&&ms.readyState==="open") ms.endOfStream(); }catch(_){}
     sb=null; ops=[]; busy=false;
+    if(err instanceof TakenOver){ watchingElsewhere(); return; }
+    if(hiddenPause) return;                          // picks up again when the tab is shown
     waiting("The stream ended","Reconnecting.",true);
     setTimeout(connect,1500);
   });
 }
+
+// A hidden tab can't show the picture (browsers pause muted video there) but
+// would keep downloading and buffering it, so drop the video until it's shown
+// again. Sound keeps playing, and the page stays the viewer.
+let hiddenPause=false;
+document.addEventListener("visibilitychange",()=>{
+  if(document.hidden){
+    if(videoAbort && !videoAbort.signal.aborted && !elsewhere){ hiddenPause=true; videoAbort.abort(); }
+  } else if(hiddenPause){
+    hiddenPause=false; connect();
+  }
+});
+
+// Another page or the Glint app took the stream. Stay quiet until the viewer
+// asks for it back (that takes it from the other one in turn).
+let elsewhere=false;
+function watchingElsewhere(){
+  elsewhere=true;
+  if(audioOn) disableAudio();
+  setState("failed","Watching elsewhere");
+  waiting("Watching somewhere else","Glint is open on another device or tab. Only one can watch at a time, so the console stopped streaming here.",false);
+  $("#takeover").hidden=false;
+}
+$("#takeover").onclick=()=>{ elsewhere=false; takeOver=true; $("#takeover").hidden=true; connect(); };
 connect();
 poll(); setInterval(poll,1000);
 setInterval(()=>{ if(sb) liveEdge(); },2000);

@@ -425,9 +425,21 @@ void App::worker() {
     broadcaster_.stop("Live broadcast stopped because the console stream ended.");
     audio_.stop();
     if (!stop_.load()) {
+        // The console streams to one viewer: if the stream just closed and
+        // someone is still watching, a browser or another PC took it.
+        bool taken = error == kTakenOver;
+        if (error.empty()) {
+            StreamStatus status;
+            std::string ignored_error;
+            taken = client.fetch_status(status, ignored_error) && status.viewers > 0;
+        }
         std::lock_guard<std::mutex> lock(mutex_);
-        error_ = error.empty() ? "Video stream stopped" : "Video: " + error;
-        logf("video stream ended: %s", error.empty() ? "closed by the console" : error.c_str());
+        if (taken)
+            error_ = "Video: Glint is open in a browser or on another PC. Connect to watch here.";
+        else
+            error_ = error.empty() ? "Video stream stopped" : "Video: " + error;
+        logf("video stream ended: %s", taken ? "another viewer took it"
+                                       : error.empty() ? "closed by the console" : error.c_str());
     }
 }
 
@@ -573,7 +585,8 @@ double App::video_hold_target_ms() const {
 
 void App::set_latency(Latency latency) {
     latency_.store((int)latency);
-    audio_.set_auto_floor_ms(latency == Latency::Smooth ? 150 : 100);
+    // Smooth also holds the picture to the sound, so it keeps a larger floor.
+    audio_.set_auto_floor_ms(latency == Latency::Smooth ? 120 : latency == Latency::Balanced ? 60 : 40);
 }
 
 bool App::post(const std::string& path, std::string& error) {

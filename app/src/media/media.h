@@ -33,6 +33,24 @@ struct GalleryItem {
 
 // .mkv / .mp4 / .png files in `dir`, newest first.
 std::vector<GalleryItem> list_gallery(const std::string& dir);
+
+// Watches a folder for files added, removed, renamed or written (Windows
+// change notifications, no polling of the files). changed() is true once
+// after each burst of changes. Watching a new folder replaces the old one.
+class FolderWatch {
+public:
+    FolderWatch() = default;
+    ~FolderWatch();
+    FolderWatch(const FolderWatch&) = delete;
+    FolderWatch& operator=(const FolderWatch&) = delete;
+    void watch(const std::string& dir);
+    bool changed();
+
+private:
+    void close();
+    void* handle_ = nullptr;
+    std::string dir_;
+};
 bool delete_gallery_file(const std::string& path, std::string& error);
 
 // Stream-copies a recording to "mp4" or "mkv" next to the original

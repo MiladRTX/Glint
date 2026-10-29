@@ -1,0 +1,86 @@
+#version 450
+// Picture enhancement, first pass, at the stream's own size: compression
+// cleanup (edge-preserving denoise, debanding) and colour (exposure,
+// saturation, shadow detail). Reads the converted RGBA picture, writes `dst`.
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 0, rgba8) uniform writeonly image2D dst;
+layout(binding = 1) uniform sampler2D src;      // nearest is fine: texel-exact reads
+
+layout(push_constant) uniform Params {
+    ivec2 size;
+    float denoise;      // 0..1
+    float deband;       // 0..1
+    float exposure;     // EV, -2..2
+    float saturation;   // 0..2, 1 = unchanged
+    float shadows;      // 0..1
+    uint  frame;        // varies the deband sample pattern over time
+} p;
+
+float luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+
+uint hash(uvec3 v)
+{
+    uint h = v.x * 0x8da6b343u ^ v.y * 0xd8163841u ^ v.z * 0xcb1ab31fu;
+    h ^= h >> 15; h *= 0x2c1b3c6du; h ^= h >> 12; h *= 0x297a2d39u; h ^= h >> 15;
+    return h;
+}
+
+vec3 fetch(ivec2 at) { return texelFetch(src, clamp(at, ivec2(0), p.size - 1), 0).rgb; }
+
+void main()
+{
+    ivec2 at = ivec2(gl_GlobalInvocationID.xy);
+    if (at.x >= p.size.x || at.y >= p.size.y) return;
+    vec3 c = fetch(at);
+
+    // Edge-preserving denoise: a 3x3 bilateral filter. Neighbours that differ
+    // a lot (edges, texture) get almost no weight, so only flat-area noise and
+    // compression speckle are averaged away.
+    if (p.denoise > 0.0) {
+        float sigma = mix(0.015, 0.09, p.denoise);
+        float inv = 1.0 / (2.0 * sigma * sigma);
+        float l0 = luma(c);
+        vec3 sum = vec3(0.0);
+        float wsum = 0.0;
+        for (int y = -1; y <= 1; y++)
+            for (int x = -1; x <= 1; x++) {
+                vec3 s = fetch(at + ivec2(x, y));
+                float d = luma(s) - l0;
+                float w = exp(-d * d * inv) * ((x == 0 && y == 0) ? 1.0 : 0.6);
+                sum += s * w;
+                wsum += w;
+            }
+        c = mix(c, sum / wsum, p.denoise);
+    }
+
+    // Debanding: compare with four points at a random angle and distance. If
+    // all of them are within a small threshold the area is a smooth gradient
+    // the encoder cut into bands; use their average there. Real detail differs
+    // by more than the threshold and is left alone.
+    if (p.deband > 0.0) {
+        uint h = hash(uvec3(at, p.frame));
+        float angle = float(h & 0xffffu) / 65536.0 * 6.2831853;
+        float radius = mix(4.0, 14.0, float(h >> 16) / 65536.0);
+        ivec2 o1 = ivec2(round(vec2(cos(angle), sin(angle)) * radius));
+        ivec2 o2 = ivec2(-o1.y, o1.x);
+        vec3 a = fetch(at + o1), b = fetch(at - o1), d = fetch(at + o2), e = fetch(at - o2);
+        vec3 avg = (a + b + d + e) * 0.25;
+        float threshold = mix(0.006, 0.03, p.deband);
+        vec3 diff = max(max(abs(a - c), abs(b - c)), max(abs(d - c), abs(e - c)));
+        if (max(diff.r, max(diff.g, diff.b)) < threshold) c = mix(c, avg, 0.85);
+    }
+
+    // Colour.
+    c *= exp2(p.exposure);
+    if (p.shadows > 0.0) {
+        // Lift the dark end only: a curve that raises shadows and leaves
+        // mid-tones and highlights where they were.
+        float l = luma(c);
+        float lift = p.shadows * 0.35 * (1.0 - smoothstep(0.0, 0.45, l));
+        c = c + lift * (1.0 - c) * c * 4.0 / (1.0 + c * 3.0);
+    }
+    if (p.saturation != 1.0) c = mix(vec3(luma(c)), c, p.saturation);
+
+    imageStore(dst, at, vec4(clamp(c, 0.0, 1.0), 1.0));
+}

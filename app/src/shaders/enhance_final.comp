@@ -1,0 +1,73 @@
+#version 450
+// Picture enhancement, last pass, at the window's size: contrast-adaptive
+// sharpening, the compare split (original on the left) and dithering.
+//
+// Sharpening follows the idea of AMD's CAS: sharpen each pixel by how much
+// room its neighbourhood leaves before clipping, so flat areas and strong edges
+// get little and soft detail gets the most. No halos, no noise boost.
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 0, rgba8) uniform writeonly image2D dst;
+layout(binding = 1) uniform sampler2D processed;   // window-sized, nearest reads
+layout(binding = 2) uniform sampler2D original;    // the stream's own picture, linear
+
+layout(push_constant) uniform Params {
+    ivec2 size;
+    float sharpness;    // 0..1, 0 = off
+    float dither;       // 0..1
+    float split;        // 0 = off, else the split's x as a fraction of the width
+    uint  frame;
+} p;
+
+uint hash(uvec3 v)
+{
+    uint h = v.x * 0x8da6b343u ^ v.y * 0xd8163841u ^ v.z * 0xcb1ab31fu;
+    h ^= h >> 15; h *= 0x2c1b3c6du; h ^= h >> 12; h *= 0x297a2d39u; h ^= h >> 15;
+    return h;
+}
+
+vec3 fetch(ivec2 at) { return texelFetch(processed, clamp(at, ivec2(0), p.size - 1), 0).rgb; }
+
+void main()
+{
+    ivec2 at = ivec2(gl_GlobalInvocationID.xy);
+    if (at.x >= p.size.x || at.y >= p.size.y) return;
+    vec2 uv = (vec2(at) + 0.5) / vec2(p.size);
+
+    vec3 c;
+    float split_x = p.split * float(p.size.x);
+    if (p.split > 0.0 && float(at.x) < split_x) {
+        c = textureLod(original, uv, 0.0).rgb;
+    } else {
+        c = fetch(at);
+        if (p.sharpness > 0.0) {
+            vec3 n = fetch(at + ivec2(0, -1)), w = fetch(at + ivec2(-1, 0));
+            vec3 e = fetch(at + ivec2(1, 0)), s = fetch(at + ivec2(0, 1));
+            vec3 mn = min(c, min(min(n, w), min(e, s)));
+            vec3 mx = max(c, max(max(n, w), max(e, s)));
+            // Diagonals widen the min/max for a steadier amount (cheap: 4 reads).
+            vec3 nw = fetch(at + ivec2(-1, -1)), ne = fetch(at + ivec2(1, -1));
+            vec3 sw = fetch(at + ivec2(-1, 1)), se = fetch(at + ivec2(1, 1));
+            vec3 mn2 = min(mn, min(min(nw, ne), min(sw, se)));
+            vec3 mx2 = max(mx, max(max(nw, ne), max(sw, se)));
+            mn += mn2; mx += mx2;
+            vec3 amp = sqrt(clamp(min(mn, 2.0 - mx) / max(mx, vec3(1e-4)), 0.0, 1.0));
+            float peak = -1.0 / mix(8.0, 4.5, p.sharpness);
+            vec3 wgt = amp * peak;
+            c = clamp((c + (n + w + e + s) * wgt) / (1.0 + 4.0 * wgt), 0.0, 1.0);
+        }
+    }
+
+    // The split: a thin light line between original and processed.
+    if (p.split > 0.0 && abs(float(at.x) + 0.5 - split_x) < 1.0) c = mix(c, vec3(1.0), 0.8);
+
+    // Dithering: up to one 8-bit step of triangular noise, so gradients don't
+    // show steps when written to the 8-bit picture.
+    if (p.dither > 0.0) {
+        uint h = hash(uvec3(at, p.frame));
+        float r = (float(h & 0xffffu) + float(h >> 16)) / 65535.0 - 1.0;
+        c += r * p.dither / 255.0;
+    }
+
+    imageStore(dst, at, vec4(clamp(c, 0.0, 1.0), 1.0));
+}

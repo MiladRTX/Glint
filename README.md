@@ -4,7 +4,7 @@
 
 **Watch, hear and record a jailbroken PS5 on your Windows PC, with low latency.**
 
-![Version](https://img.shields.io/badge/version-1.0-informational)
+![Version](https://img.shields.io/badge/version-1.5-informational)
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078D6)
 ![Console](https://img.shields.io/badge/console-PS5%20(jailbroken)-003791)
 ![Language](https://img.shields.io/badge/C%2B%2B17%20%2B%20C11-00599C)
@@ -50,6 +50,12 @@ No capture card needed. A browser can also open the payload directly.
 - **Recording** to MKV (H.264 copy + AAC, nothing re-encoded) and PNG
   **screenshots**.
 - **Gallery** with thumbnails, export to MP4/MKV and delete.
+- **Picture enhancement** (Settings → Picture): upscaling with Bilinear,
+  Lanczos, AMD FSR 1 or an AI network (FSRCNNX), contrast-adaptive
+  sharpening, denoise, debanding and colour. Profiles, your own saved
+  presets, and a frame-time guard that steps down on a weak GPU.
+- **Side-by-side compare** (C): the original and the enhanced picture next to
+  each other, zoomed and panned together, with a tweak panel (X).
 - **Built-in viewer.** Recordings play with sound, seek and volume.
   Screenshots zoom and pan.
 - **Dark and light theme** (dark by default), animated UI, auto-hiding
@@ -64,6 +70,8 @@ No capture card needed. A browser can also open the payload directly.
   console, keyframe and stop. See [API.md](docs/API.md).
 - **Browser dashboard** at `http://<ps5-ip>:7231/`: live view, sound,
   screenshots, console recordings, dark and light theme. Nothing to install.
+- **One viewer at a time:** the newest browser or app takes the stream; the
+  others see "watching somewhere else" and can take it back.
 - On-screen notifications on the console when it loads, is ready, or hits a
   problem.
 
@@ -83,7 +91,7 @@ Download both from the [latest release](https://github.com/MiladRTX/Glint/releas
 or build them yourself ([Building](#building)):
 
 - `Glint.exe`, the Windows app (one file, nothing to install)
-- `Glint-1.0-ps5.elf`, the PS5 payload
+- `Glint-1.5-ps5.elf`, the PS5 payload
 
 ### 2. Run the payload
 
@@ -91,20 +99,20 @@ Upload the ELF to Payload Manager's folder on the console (FTP on port 2121
 here; use your console's IP):
 
 ```bash
-curl --ftp-create-dirs -T Glint-1.0-ps5.elf ftp://<ps5-ip>:2121/data/pldmgr/payloads/local/glint/Glint-1.0-ps5.elf
+curl --ftp-create-dirs -T Glint-1.5-ps5.elf ftp://<ps5-ip>:2121/data/pldmgr/payloads/local/glint/Glint-1.5-ps5.elf
 ```
 
 A self-built ELF is `payload/build/glint-payload.elf`; upload it under the same
 name.
 
 Then start **Glint** from Payload Manager on the console. You will see
-*"Glint 1.0 loaded. Starting capture..."*, then *"Glint ready on
+*"Glint 1.5 loaded. Starting capture..."*, then *"Glint ready on
 port 7231"*.
 
 > [!TIP]
 > Payload Manager expects names shaped like `Name-version-ps5.elf`. If the
-> console says *"the PS5 refused to start video capture"*, wait a minute and
-> run it again.
+> console says *"the PS5 refused to start video capture"*, just run it again.
+> This often happens on the first try after the PS5 starts.
 
 ### 3. Connect
 
@@ -190,6 +198,7 @@ dependency: [docs/BUILD.md](docs/BUILD.md).
 | `R` | Start/stop recording | | `T` | Dark / light theme |
 | `G` | Gallery | | `F11` | Full screen |
 | `P` | Picture size (fit / fill / no upscaling) | | `Ctrl+,` | Settings |
+| `C` | Side-by-side compare | | `X` | Tweak panel (in compare) |
 
 In the viewer: `Space` play/pause, `←` `→` seek 5 s (or previous/next
 picture), `↑` `↓` volume, `Page Up` / `Page Down` previous/next item, `Esc`
@@ -293,8 +302,10 @@ Built with [Dear ImGui](https://github.com/ocornut/imgui),
 [FFmpeg](https://ffmpeg.org/), [curl](https://curl.se/),
 [SDL2](https://www.libsdl.org/), [GLFW](https://www.glfw.org/),
 [x264](https://www.videolan.org/developers/x264.html), the
-[Geist](https://vercel.com/font) typeface (SIL OFL), and the
-[PS5 payload SDK](https://github.com/ps5-payload-dev/sdk).
+[Geist](https://vercel.com/font) typeface (SIL OFL), the
+[PS5 payload SDK](https://github.com/ps5-payload-dev/sdk),
+[AMD FidelityFX FSR 1](https://github.com/GPUOpen-Effects/FidelityFX-FSR) (MIT) and
+[FSRCNNX](https://github.com/igv/FSRCNN-TensorFlow) (LGPL-3.0) for the upscalers.
 
 ## License
 

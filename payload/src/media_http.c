@@ -79,9 +79,9 @@ static int client_alive(int fd)
 
 /* Called with g.lock held: wait up to one second for new media on the ring
  * identified by `audio`, or for the viewer to disconnect. Returns 0 when the
- * caller should stop (server stopping, stream generation bumped, or peer
- * closed), non-zero to keep streaming. */
-static int wait_media(int fd, uint64_t generation, int audio)
+ * caller should stop (server stopping, stream generation bumped, another
+ * viewer took over, or peer closed), non-zero to keep streaming. */
+static int wait_media(int fd, uint64_t generation, int audio, uint64_t epoch)
 {
     if (!g.running) return 0;
     struct timespec ts;
@@ -91,6 +91,7 @@ static int wait_media(int fd, uint64_t generation, int audio)
 
     if (!g.running) return 0;
     if (generation != (audio ? g.audio_generation : g.video_generation)) return 0;
+    if (epoch != g.viewer_epoch) return 0;
     return client_alive(fd);
 }
 
@@ -173,14 +174,15 @@ void sl_http_status(int fd)
 
     int n = snprintf(json, sizeof(json),
         "{\"version\":\"" SL_VERSION "\",\"backend\":\"h264\",\"width\":%d,\"height\":%d,\"frames\":%llu,\"bytes\":%llu,"
-        "\"fps\":%.1f,\"kbps\":%.1f,\"clients\":%d,\"recording\":%s,"
+        "\"fps\":%.1f,\"kbps\":%.1f,\"clients\":%d,\"viewers\":%d,\"bitrate\":%u,\"recording\":%s,"
         "\"recording_name\":\"%s\",\"recording_frames\":%llu,\"recording_bytes\":%llu,"
         "\"recording_seconds\":%.1f,\"recording_error\":%s,"
         "\"audio_chunks\":%llu,\"audio_bytes\":%llu,\"audio_kbps\":%.1f,"
         "\"audio_codec\":\"%s\"}",
         g.width, g.height,
         (unsigned long long)g.video_frames, (unsigned long long)g.video_bytes,
-        fps, kbps, g.client_count, recording ? "true" : "false",
+        fps, kbps, g.client_count, g.viewer_streams > 0 ? 1 : 0,
+        (unsigned)sl_opts.bitrate, recording ? "true" : "false",
         name,
         (unsigned long long)g.rec_frames, (unsigned long long)g.rec_bytes,
         seconds, g.rec_error ? "true" : "false",
@@ -195,7 +197,7 @@ void sl_http_status(int fd)
 /* ------------------------------------------------------------------ */
 /* /frames                                                             */
 /* ------------------------------------------------------------------ */
-void sl_http_stream(int fd)
+void sl_http_stream(int fd, uint64_t epoch)
 {
     sl_send_all(fd, STREAM_HEAD, sizeof(STREAM_HEAD) - 1);
 
@@ -215,9 +217,9 @@ void sl_http_stream(int fd)
     uint8_t *packet = NULL;
     size_t packet_cap = 0;
 
-    while (g.running && generation == g.video_generation) {
+    while (g.running && generation == g.video_generation && epoch == g.viewer_epoch) {
         if (g.video_seq < cursor) {
-            if (!wait_media(fd, generation, 0)) break;
+            if (!wait_media(fd, generation, 0, epoch)) break;
             continue;
         }
 
@@ -266,7 +268,7 @@ void sl_http_stream(int fd)
 /* ------------------------------------------------------------------ */
 /* /audio                                                              */
 /* ------------------------------------------------------------------ */
-void sl_http_audio(int fd)
+void sl_http_audio(int fd, uint64_t epoch)
 {
     sl_send_all(fd, STREAM_HEAD, sizeof(STREAM_HEAD) - 1);
 
@@ -284,9 +286,9 @@ void sl_http_audio(int fd)
         return;
     }
 
-    while (g.running && generation == g.audio_generation) {
+    while (g.running && generation == g.audio_generation && epoch == g.viewer_epoch) {
         if (g.audio_seq < cursor) {
-            if (!wait_media(fd, generation, 1)) break;
+            if (!wait_media(fd, generation, 1, epoch)) break;
             continue;
         }
         sl_audio_slot *slot = &g.audio[cursor & (SL_AUDIO_SLOTS - 1)];
@@ -394,7 +396,7 @@ static uint32_t rtp_ssrc(int fd, uint64_t started)
     return value ? value : 1;
 }
 
-void sl_http_rtp(int fd, int port)
+void sl_http_rtp(int fd, int port, uint64_t epoch)
 {
     struct sockaddr_in peer;
 #ifdef _WIN32
@@ -424,9 +426,9 @@ void sl_http_rtp(int fd, int port)
     const uint8_t *nals[256];
     size_t sizes[256];
 
-    while (g.running && generation == g.video_generation) {
+    while (g.running && generation == g.video_generation && epoch == g.viewer_epoch) {
         if (g.video_seq < cursor) {
-            if (!wait_media(fd, generation, 0)) break;
+            if (!wait_media(fd, generation, 0, epoch)) break;
             continue;
         }
         sl_video_slot *slot = &g.video[cursor & (SL_VIDEO_SLOTS - 1)];

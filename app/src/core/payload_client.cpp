@@ -270,6 +270,7 @@ bool PayloadClient::fetch_status(StreamStatus& status, std::string& error) {
     status.fps = json_double(document, "fps");
     status.kbps = json_double(document, "kbps");
     status.clients = static_cast<int>(json_int(document, "clients"));
+    status.viewers = static_cast<int>(json_int(document, "viewers"));
     status.recording = json_bool(document, "recording");
     status.recording_name = json_string(document, "recording_name");
     status.recording_frames = static_cast<unsigned long long>(json_int(document, "recording_frames"));
@@ -371,7 +372,10 @@ bool PayloadClient::stream_frames(const FrameCallback& callback, std::atomic_boo
         error = "curl_easy_init failed";
         return false;
     }
-    curl_easy_setopt(curl, CURLOPT_URL, (base_ + "/frames").c_str());
+    // One viewer at a time: the app only connects when asked to, so it takes
+    // the stream from whoever has it (docs/API.md).
+    curl_easy_setopt(curl, CURLOPT_URL, (base_ + "/frames?take=1").c_str());
+    curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
     curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
     curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, +progress);
     curl_easy_setopt(curl, CURLOPT_XFERINFODATA, &context);
@@ -384,8 +388,14 @@ bool PayloadClient::stream_frames(const FrameCallback& callback, std::atomic_boo
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "Glint/1.0");
 
     CURLcode result = curl_easy_perform(curl);
+    long http_status = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_status);
     curl_easy_cleanup(curl);
 
+    if (result == CURLE_HTTP_RETURNED_ERROR && http_status == 409) {
+        error = kTakenOver;
+        return false;
+    }
     if (state.failed) {
         error = state.error;
         return false;
@@ -441,7 +451,8 @@ bool PayloadClient::stream_audio(const AudioCallback& callback, std::atomic_bool
         error = "curl_easy_init failed";
         return false;
     }
-    curl_easy_setopt(curl, CURLOPT_URL, (base_ + "/audio").c_str());
+    curl_easy_setopt(curl, CURLOPT_URL, (base_ + "/audio").c_str());   // never takes: it reconnects on its own
+    curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
     curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
     curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, +progress);
     curl_easy_setopt(curl, CURLOPT_XFERINFODATA, &context);
@@ -454,8 +465,14 @@ bool PayloadClient::stream_audio(const AudioCallback& callback, std::atomic_bool
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "Glint/1.0");
 
     CURLcode result = curl_easy_perform(curl);
+    long http_status = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_status);
     curl_easy_cleanup(curl);
 
+    if (result == CURLE_HTTP_RETURNED_ERROR && http_status == 409) {
+        error = kTakenOver;
+        return false;
+    }
     if (state.failed) {
         error = state.error;
         return false;

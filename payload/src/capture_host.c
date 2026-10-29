@@ -121,6 +121,11 @@ static void *capture_main(void *arg)
     return NULL;
 }
 
+int sl_capture_failed(void)
+{
+    return 0;   /* the synthetic stream always starts */
+}
+
 int sl_capture_start(void)
 {
     if (capture_active) return 0;

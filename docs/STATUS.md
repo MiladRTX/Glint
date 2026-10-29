@@ -46,7 +46,7 @@ minute between sessions before it will start again.
 - **Built-in viewer** for the gallery: recordings play with sound, seek and
   volume; screenshots zoom and pan. `--view <file>` opens one directly.
 - **One file, no console window**: static exe built as a Windows app; version
-  1.0 (app and payload).
+  1.5 (app and payload).
 - **Video page**: GPU/CPU decode, GPU/CPU colour conversion, Latency, graphics
   info. The top chip shows the fps and Mbit/s actually received over the last 2 s.
 
@@ -72,7 +72,6 @@ real console stream (the host build's synthetic stream is not a decodable image)
 
 - Re-encoding PC recorder (frame-rate / bitrate options).
 - Console recording library in the app (browse/download console recordings).
-- Image-quality panel (upscale / sharpen / denoise).
 - Plugin manager.
 
 Out of scope: Sony Remote Play and cloud sessions.

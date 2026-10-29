@@ -37,9 +37,11 @@ constexpr double kWarmupSeconds = 5.0;
 // Auto delay: cover the worst recent arrival lateness (how far packets ran
 // behind the media clock, which is what drains the ring; a run of slightly
 // late packets counts, not just one long gap) plus one callback and one packet
-// of granularity. The memory halves every 60 s.
-constexpr double kAutoMarginMs = 50.0;
-constexpr double kAutoMinMsDefault = 150.0;
+// of granularity. The memory halves every 60 s. Margin and floors were 50 and
+// 100-150 ms; on Wi-Fi with gaps up to ~60 ms that sat ~190 ms behind the
+// picture for no measured gain (no underruns at the lower values).
+constexpr double kAutoMarginMs = 25.0;
+constexpr double kAutoMinMsDefault = 60.0;
 constexpr double kAutoHalfLifeS = 60.0;
 constexpr double kAutoInitialGapMs = 70.0;
 
@@ -436,7 +438,7 @@ float AudioPlayer::volume() const { return impl_->volume.load(); }
 void AudioPlayer::set_delay_ms(int ms) { impl_->delay_ms.store(std::clamp(ms, 0, kMaxDelayMs)); }
 int AudioPlayer::delay_ms() const { return impl_->delay_ms.load(); }
 void AudioPlayer::set_delay_auto(bool on) { impl_->delay_auto.store(on); }
-void AudioPlayer::set_auto_floor_ms(int ms) { impl_->auto_floor_ms.store(std::clamp(ms, 50, kMaxDelayMs)); }
+void AudioPlayer::set_auto_floor_ms(int ms) { impl_->auto_floor_ms.store(std::clamp(ms, 30, kMaxDelayMs)); }
 bool AudioPlayer::delay_auto() const { return impl_->delay_auto.load(); }
 
 int AudioPlayer::effective_delay_ms() const {

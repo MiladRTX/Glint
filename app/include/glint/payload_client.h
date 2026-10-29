@@ -36,6 +36,7 @@ struct StreamStatus {
     double fps = 0.0;
     double kbps = 0.0;
     int clients = 0;
+    int viewers = 0;                  // people watching (the console allows one)
     bool recording = false;
     std::string recording_name;
     unsigned long long recording_frames = 0;
@@ -47,6 +48,9 @@ struct StreamStatus {
     double audio_kbps = 0.0;
     std::string audio_codec;
 };
+
+// stream_frames/stream_audio error when another viewer has the stream (HTTP 409).
+constexpr const char* kTakenOver = "someone else is watching";
 
 // Port the Glint payload listens on.
 constexpr int kPayloadPort = 7231;

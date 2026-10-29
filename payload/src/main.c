@@ -10,12 +10,21 @@ sl_options sl_opts = {
     .port = 7231,
     .height = 1080,
     .fps = 60,
-    .bitrate = 60000000u,
+    /* Measured in a busy game over Wi-Fi: 20 Mbit/s hitched about half as
+     * often as 30 (40 and 60 more still). Set once at start: the encoder
+     * can't change it on a running session. */
+    .bitrate = 20000000u,
     .minqp = 18,
     .audio = 1,
 };
 
 static volatile int g_quit = 0;
+
+#ifdef SL_PS5
+/* The name in the console's process list (Payload Manager shows "payload.elf"
+ * otherwise). Weak: a firmware without it still loads Glint. */
+int sceKernelSetProcessName(const char *name) __attribute__((weak));
+#endif
 
 static void on_signal(int sig)
 {
@@ -86,6 +95,9 @@ int main(int argc, char **argv)
     /* Log, recordings and marker files from before the rename (Screenlink). */
     if (access("/data/glint", F_OK) != 0 && access("/data/screenlink", F_OK) == 0)
         rename("/data/screenlink", "/data/glint");
+    /* ".elf": Payload Manager lists only names ending in .elf as payloads;
+     * anything else goes under "Show All System Processes". */
+    if (sceKernelSetProcessName) sceKernelSetProcessName("Glint.elf");
 #endif
 
     sl_notify(0, "Glint " SL_VERSION " loaded. Starting capture...");
@@ -104,6 +116,7 @@ int main(int argc, char **argv)
             continue;
         }
         if (g.started_ms != 0) break;             /* server ran, then stopped */
+        if (sl_capture_failed()) break;           /* encoder refused: no point waiting */
         if (sl_now_ms() - wait_started > 30000) break;
         sl_sleep_ms(100);
     }

@@ -36,7 +36,7 @@ over any other payload's folder:
 
 ```bash
 curl -s --ftp-create-dirs -T payload/build/glint-payload.elf \
-  ftp://$PS5:2121/data/pldmgr/payloads/local/glint/Glint-1.0-ps5.elf
+  ftp://$PS5:2121/data/pldmgr/payloads/local/glint/Glint-1.5-ps5.elf
 ```
 
 Payload Manager only accepts files under its payload tree and a name shaped like
@@ -46,7 +46,7 @@ After uploading, read the file back and compare the hash before loading — an
 upload interrupted by the console sleeping can leave a truncated file:
 
 ```bash
-curl -s ftp://$PS5:2121/data/pldmgr/payloads/local/glint/Glint-1.0-ps5.elf -o check.elf
+curl -s ftp://$PS5:2121/data/pldmgr/payloads/local/glint/Glint-1.5-ps5.elf -o check.elf
 sha256sum payload/build/glint-payload.elf check.elf
 ```
 
@@ -54,13 +54,13 @@ sha256sum payload/build/glint-payload.elf check.elf
 
 ```bash
 curl -s -X POST -H "X-PLDMGR-Request: 1" \
-  "http://$PS5:8084/loadpayload:/data/pldmgr/payloads/local/glint/Glint-1.0-ps5.elf"
+  "http://$PS5:8084/loadpayload:/data/pldmgr/payloads/local/glint/Glint-1.5-ps5.elf"
 ```
 
 The payload shows a banner on the console: "Glint loaded", then
 "Glint ready on port 7231" once capture starts. If the encoder is busy it
-shows "the PS5 refused to start video capture (0x80c78000)" — wait a minute and
-load it again.
+shows "the PS5 refused to start video capture (0x80c78000)" — load it again.
+This often happens on the first try after the PS5 starts; the second works.
 
 ## 4. Validate
 

@@ -200,7 +200,10 @@ static void SetupVulkan(ImVector<const char*> instance_extensions)
     {
         VkDescriptorPoolSize pool_sizes[] =
         {
-            { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 8 },
+            // One per texture ImGui draws: the font, the live picture, the
+            // enhanced picture, the viewer and one per gallery thumbnail.
+            // 8 ran out once the gallery held a few files (abort on open).
+            { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1024 },
         };
         VkDescriptorPoolCreateInfo pool_info = {};
         pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -408,7 +411,16 @@ struct VideoTexture {
     int            width = 0;
     int            height = 0;
     bool           uploaded = false;
+    bool           live = false;   // the console picture: gets the enhancement passes
 };
+
+// Picture enhancement passes, recorded after each upload (defined below).
+static void enhance_record(VkCommandBuffer cmd, VideoTexture& tex);
+
+// Bumped whenever a picture image is recreated. Descriptor caches compare
+// view handles, and a new view can reuse a freed one's value, so they also
+// rebind when this changes.
+static uint32_t g_view_generation = 0;
 
 static uint32_t find_memory_type(uint32_t bits, VkMemoryPropertyFlags properties)
 {
@@ -513,7 +525,9 @@ static void destroy_texture(VideoTexture& tex)
     if (tex.sampler) vkDestroySampler(g_Device, tex.sampler, g_Allocator);
     if (tex.staging) vkDestroyBuffer(g_Device, tex.staging, g_Allocator);
     if (tex.staging_memory) vkFreeMemory(g_Device, tex.staging_memory, g_Allocator);
+    bool live = tex.live;
     tex = VideoTexture{};
+    tex.live = live;
 }
 
 static void ensure_image(VideoTexture& tex, int width, int height)
@@ -580,6 +594,7 @@ static void ensure_image(VideoTexture& tex, int width, int height)
     tex.width = width;
     tex.height = height;
     tex.uploaded = false;
+    g_view_generation++;   // a new view can reuse the old handle value: make the converter rebind
 }
 
 static void upload_frame(VideoTexture& tex, const std::vector<uint8_t>& rgba, int width, int height)
@@ -631,6 +646,7 @@ static void upload_frame(VideoTexture& tex, const std::vector<uint8_t>& rgba, in
                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
     image_barrier(cmd, tex.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    enhance_record(cmd, tex);
     end_once();
 
     tex.uploaded = true;
@@ -857,6 +873,7 @@ static void yuv_ensure_plane(YuvPlane& p, int width, int height, VkFormat format
     p.height = height;
     p.format = format;
     p.initialised = false;
+    g_view_generation++;   // the new view may reuse an old handle value
 }
 
 // Converts `pic` (NV12 / I420) into `tex` on the GPU. Returns false if the
@@ -900,7 +917,9 @@ static bool upload_yuv(VideoTexture& tex, const glint::Picture& pic)
     std::memcpy(g_yuv.mapped, pic.data.data(), pic.data.size());
 
     VkImageView want[4] = {tex.view, g_yuv.planes[0].view, g_yuv.planes[1].view, g_yuv.planes[2].view};
-    if (std::memcmp(want, g_yuv.bound, sizeof(want)) != 0) {
+    static uint32_t bound_generation = 0;
+    if (std::memcmp(want, g_yuv.bound, sizeof(want)) != 0 || bound_generation != g_view_generation) {
+        bound_generation = g_view_generation;
         VkDescriptorImageInfo images[4] = {};
         images[0] = {VK_NULL_HANDLE, tex.view, VK_IMAGE_LAYOUT_GENERAL};
         images[1] = {g_yuv.nearest, g_yuv.planes[0].view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
@@ -953,6 +972,7 @@ static bool upload_yuv(VideoTexture& tex, const glint::Picture& pic)
     vkCmdDispatch(cmd, (uint32_t)(w + 15) / 16, (uint32_t)(h + 15) / 16, 1);
     layout_barrier(cmd, tex.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                    VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+    enhance_record(cmd, tex);
     end_once();
 
     tex.uploaded = true;
@@ -1000,6 +1020,511 @@ static bool read_texture(VideoTexture& tex, std::vector<uint8_t>& rgba)
     vkDestroyBuffer(g_Device, buffer, g_Allocator);
     vkFreeMemory(g_Device, memory, g_Allocator);
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// Picture enhancement (Settings -> Picture): compute passes between the
+// converted picture and the screen, recorded into the same command buffer as
+// the upload, so they add no CPU wait.
+//   pre    cleanup + colour at the stream's size   (live tex -> a)
+//   scale  upscale to the window's pixel size       (a -> b), only when larger
+//   final  sharpen, compare split, dither           (b or a -> out)
+// Off draws the converted picture as before: no passes, no cost.
+// ---------------------------------------------------------------------------
+
+static const uint32_t kEnhancePreSpv[] =
+#include "shaders/enhance_pre.spv.inc"
+;
+static const uint32_t kEnhanceScaleSpv[] =
+#include "shaders/enhance_scale.spv.inc"
+;
+static const uint32_t kEnhanceFinalSpv[] =
+#include "shaders/enhance_final.spv.inc"
+;
+static const uint32_t kEnhanceEasuSpv[] =
+#include "shaders/enhance_easu.spv.inc"
+;
+static const uint32_t kFsrcnnxLumaSpv[] =
+#include "shaders/fsrcnnx_luma.spv.inc"
+;
+static const uint32_t kFsrcnnxOutSpv[] =
+#include "shaders/fsrcnnx_out.spv.inc"
+;
+
+// One FSRCNNX layer (tools/gen_fsrcnnx.js): reads up to three named images at
+// the stream's size, writes one.
+struct FsrcnnxLayer {
+    const char* desc;
+    const uint32_t* spv;
+    size_t bytes;
+    const char* save;
+    const char* binds[3];
+};
+#include "shaders/fsrcnnx/passes.inc"
+constexpr int kFsrcnnxLayerCount = (int)(sizeof(kFsrcnnxLayers) / sizeof(kFsrcnnxLayers[0]));
+// The images the layers read and write (mpv's names), all RGBA16F.
+static const char* const kFsrcnnxImages[] = {"LUMA",   "FEATURE1", "FEATURE2", "MODEL21", "MODEL22",
+                                             "MODEL1", "MODEL2",   "RES1",     "RES2",    "SUBCONV1"};
+constexpr int kFsrcnnxImageCount = (int)(sizeof(kFsrcnnxImages) / sizeof(kFsrcnnxImages[0]));
+
+enum Upscaler { UpscaleBilinear, UpscaleLanczos, UpscaleFsr, UpscaleAi };
+static const char* const kUpscalerNames[] = {"Bilinear", "Lanczos", "FSR 1", "AI"};
+
+// What the passes do this frame, resolved from the profile (or Custom).
+struct EnhanceParams {
+    bool active = false;
+    int upscaler = 0;   // Upscaler
+    float sharpness = 0, denoise = 0, deband = 0, dither = 0;
+    float exposure = 0, saturation = 1, shadows = 0;
+};
+
+struct EnhanceImage {
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;
+    int width = 0, height = 0;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    bool initialised = false;   // has been written once (layout SHADER_READ_ONLY)
+};
+
+// Pipelines; the FSRCNNX layers follow EnhanceNet.
+enum { EnhancePre, EnhanceScale, EnhanceFinal, EnhanceEasu, EnhanceAiLuma, EnhanceAiOut, EnhanceNet };
+constexpr int kEnhancePipelines = EnhanceNet + kFsrcnnxLayerCount;
+
+struct Enhancer {
+    bool tried = false, available = false;
+    std::string error;
+    VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
+    VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
+    VkPipeline pipelines[kEnhancePipelines] = {};
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+    VkDescriptorSet sets[kEnhancePipelines] = {};   // one per pipeline: each runs once a frame
+    VkImageView bound[kEnhancePipelines][4] = {};
+    VkSampler nearest = VK_NULL_HANDLE, linear = VK_NULL_HANDLE;
+    EnhanceImage a, b, out, ai2x;
+    EnhanceImage net[kFsrcnnxImageCount];
+    VkDescriptorSet out_descriptor = VK_NULL_HANDLE;   // `out` for ImGui
+    // GPU time of the passes, from timestamps read one frame later.
+    VkQueryPool queries = VK_NULL_HANDLE;
+    float timestamp_ns = 0.0f;
+    bool query_pending = false;
+    float gpu_ms = 0.0f;          // smoothed
+    // This frame's settings and the window's pixel size for the picture
+    // (set by the UI, used by the next upload).
+    EnhanceParams params;
+    int want_w = 0, want_h = 0;
+    uint32_t frame = 0;
+    bool shown = false;           // `out` holds the current frame: draw it instead of the live texture
+    int used_upscaler = -1;       // what last frame's upscale really was (-1: none, window not larger)
+    float split = 0.0f;           // compare split, 0 = off
+};
+static Enhancer g_enh;
+
+// Side-by-side compare (Settings -> Picture, or C): the same spot of the
+// original and the enhanced picture next to each other, zoomed and panned
+// together.
+struct Compare {
+    bool on = false;
+    float zoom = 1.0f;              // 1 = the whole picture fits a panel
+    ImVec2 center = {0.5f, 0.5f};   // middle of the view, in picture UV
+    bool dragging = false;
+};
+static Compare g_compare;
+static bool g_tweaks_open = false;   // side by side's control panel (X)
+
+static bool enhance_init()
+{
+    if (g_enh.tried) return g_enh.available;
+    g_enh.tried = true;
+    if (!yuv_converter_init()) {   // same requirements: compute on the graphics queue, RGBA storage images
+        g_enh.error = g_yuv.error;
+        return false;
+    }
+    VkFormatProperties fp;
+    vkGetPhysicalDeviceFormatProperties(g_PhysicalDevice, VK_FORMAT_R16G16B16A16_SFLOAT, &fp);
+    bool half_storage = (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0;
+
+    VkSamplerCreateInfo si = {};
+    si.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    si.magFilter = si.minFilter = VK_FILTER_NEAREST;
+    if (vkCreateSampler(g_Device, &si, g_Allocator, &g_enh.nearest) != VK_SUCCESS) return false;
+    si.magFilter = si.minFilter = VK_FILTER_LINEAR;
+    if (vkCreateSampler(g_Device, &si, g_Allocator, &g_enh.linear) != VK_SUCCESS) return false;
+
+    // One layout for every pass: the output, then up to three inputs.
+    VkDescriptorSetLayoutBinding bindings[4] = {};
+    for (int i = 0; i < 4; i++) {
+        bindings[i].binding = (uint32_t)i;
+        bindings[i].descriptorType = i == 0 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        bindings[i].descriptorCount = 1;
+        bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo dl = {};
+    dl.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    dl.bindingCount = 4;
+    dl.pBindings = bindings;
+    if (vkCreateDescriptorSetLayout(g_Device, &dl, g_Allocator, &g_enh.set_layout) != VK_SUCCESS) return false;
+    VkPushConstantRange pc = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 64};
+    VkPipelineLayoutCreateInfo pl = {};
+    pl.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    pl.setLayoutCount = 1;
+    pl.pSetLayouts = &g_enh.set_layout;
+    pl.pushConstantRangeCount = 1;
+    pl.pPushConstantRanges = &pc;
+    if (vkCreatePipelineLayout(g_Device, &pl, g_Allocator, &g_enh.pipeline_layout) != VK_SUCCESS) return false;
+
+    struct Code { const uint32_t* words; size_t bytes; };
+    Code code[kEnhancePipelines] = {{kEnhancePreSpv, sizeof(kEnhancePreSpv)},   {kEnhanceScaleSpv, sizeof(kEnhanceScaleSpv)},
+                                    {kEnhanceFinalSpv, sizeof(kEnhanceFinalSpv)}, {kEnhanceEasuSpv, sizeof(kEnhanceEasuSpv)},
+                                    {kFsrcnnxLumaSpv, sizeof(kFsrcnnxLumaSpv)},   {kFsrcnnxOutSpv, sizeof(kFsrcnnxOutSpv)}};
+    for (int i = 0; i < kFsrcnnxLayerCount; i++) code[EnhanceNet + i] = {kFsrcnnxLayers[i].spv, kFsrcnnxLayers[i].bytes};
+    for (int i = 0; i < kEnhancePipelines; i++) {
+        if (!half_storage && (i == EnhanceAiLuma || i >= EnhanceNet)) continue;   // AI needs RGBA16F storage
+        VkShaderModuleCreateInfo sm = {};
+        sm.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        sm.codeSize = code[i].bytes;
+        sm.pCode = code[i].words;
+        VkShaderModule module = VK_NULL_HANDLE;
+        if (vkCreateShaderModule(g_Device, &sm, g_Allocator, &module) != VK_SUCCESS) {
+            g_enh.error = "cannot load the picture shaders";
+            return false;
+        }
+        VkComputePipelineCreateInfo cp = {};
+        cp.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        cp.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        cp.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        cp.stage.module = module;
+        cp.stage.pName = "main";
+        cp.layout = g_enh.pipeline_layout;
+        VkResult r = vkCreateComputePipelines(g_Device, g_PipelineCache, 1, &cp, g_Allocator, &g_enh.pipelines[i]);
+        vkDestroyShaderModule(g_Device, module, g_Allocator);
+        if (r != VK_SUCCESS) {
+            g_enh.error = "cannot create the picture pipelines";
+            return false;
+        }
+    }
+
+    VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, (uint32_t)kEnhancePipelines},
+                                     {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3u * kEnhancePipelines}};
+    VkDescriptorPoolCreateInfo dp = {};
+    dp.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    dp.maxSets = kEnhancePipelines;
+    dp.poolSizeCount = 2;
+    dp.pPoolSizes = sizes;
+    if (vkCreateDescriptorPool(g_Device, &dp, g_Allocator, &g_enh.pool) != VK_SUCCESS) return false;
+    std::vector<VkDescriptorSetLayout> layouts(kEnhancePipelines, g_enh.set_layout);
+    VkDescriptorSetAllocateInfo da = {};
+    da.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    da.descriptorPool = g_enh.pool;
+    da.descriptorSetCount = kEnhancePipelines;
+    da.pSetLayouts = layouts.data();
+    if (vkAllocateDescriptorSets(g_Device, &da, g_enh.sets) != VK_SUCCESS) return false;
+
+    // GPU timing, where the queue supports timestamps.
+    VkPhysicalDeviceProperties props;
+    vkGetPhysicalDeviceProperties(g_PhysicalDevice, &props);
+    uint32_t count = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(g_PhysicalDevice, &count, nullptr);
+    std::vector<VkQueueFamilyProperties> families(count);
+    vkGetPhysicalDeviceQueueFamilyProperties(g_PhysicalDevice, &count, families.data());
+    if (g_QueueFamily < count && families[g_QueueFamily].timestampValidBits > 0 && props.limits.timestampPeriod > 0) {
+        VkQueryPoolCreateInfo qi = {};
+        qi.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+        qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        qi.queryCount = 2;
+        if (vkCreateQueryPool(g_Device, &qi, g_Allocator, &g_enh.queries) == VK_SUCCESS)
+            g_enh.timestamp_ns = props.limits.timestampPeriod;
+    }
+    g_enh.available = true;
+    return true;
+}
+
+// The AI upscaler can run here (RGBA16F storage images are supported).
+static bool enhance_ai_available()
+{
+    return enhance_init() && g_enh.pipelines[EnhanceNet] != VK_NULL_HANDLE;
+}
+
+static void enhance_destroy_image(EnhanceImage& im)
+{
+    if (im.view) vkDestroyImageView(g_Device, im.view, g_Allocator);
+    if (im.image) vkDestroyImage(g_Device, im.image, g_Allocator);
+    if (im.memory) vkFreeMemory(g_Device, im.memory, g_Allocator);
+    im = EnhanceImage{};
+}
+
+static void enhance_destroy()
+{
+    if (g_Device == VK_NULL_HANDLE || !g_enh.tried) return;
+    vkDeviceWaitIdle(g_Device);
+    if (g_enh.out_descriptor) ImGui_ImplVulkan_RemoveTexture(g_enh.out_descriptor);
+    for (EnhanceImage* im : {&g_enh.a, &g_enh.b, &g_enh.out, &g_enh.ai2x}) enhance_destroy_image(*im);
+    for (EnhanceImage& im : g_enh.net) enhance_destroy_image(im);
+    if (g_enh.queries) vkDestroyQueryPool(g_Device, g_enh.queries, g_Allocator);
+    if (g_enh.pool) vkDestroyDescriptorPool(g_Device, g_enh.pool, g_Allocator);
+    for (VkPipeline p : g_enh.pipelines)
+        if (p) vkDestroyPipeline(g_Device, p, g_Allocator);
+    if (g_enh.pipeline_layout) vkDestroyPipelineLayout(g_Device, g_enh.pipeline_layout, g_Allocator);
+    if (g_enh.set_layout) vkDestroyDescriptorSetLayout(g_Device, g_enh.set_layout, g_Allocator);
+    if (g_enh.nearest) vkDestroySampler(g_Device, g_enh.nearest, g_Allocator);
+    if (g_enh.linear) vkDestroySampler(g_Device, g_enh.linear, g_Allocator);
+    g_enh = Enhancer{};
+}
+
+// (Re)creates `im` at the size and format. Returns true if it changed.
+static bool enhance_ensure_image(EnhanceImage& im, int width, int height,
+                                 VkFormat format = VK_FORMAT_R8G8B8A8_UNORM)
+{
+    if (im.image && im.width == width && im.height == height && im.format == format) return false;
+    // A new view can get the old one's handle value: forget what every set was
+    // bound to, or enhance_bind would skip the update and leave the set
+    // pointing at freed memory (device lost when zooming fast).
+    std::memset(g_enh.bound, 0, sizeof(g_enh.bound));
+    g_view_generation++;
+    if (im.image) {
+        vkDeviceWaitIdle(g_Device);   // the old image may still be in flight
+        if (&im == &g_enh.out && g_enh.out_descriptor) {
+            ImGui_ImplVulkan_RemoveTexture(g_enh.out_descriptor);
+            g_enh.out_descriptor = VK_NULL_HANDLE;
+        }
+    }
+    enhance_destroy_image(im);
+    VkImageCreateInfo info = {};
+    info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    info.imageType = VK_IMAGE_TYPE_2D;
+    info.format = format;
+    info.extent = {(uint32_t)width, (uint32_t)height, 1};
+    info.mipLevels = 1;
+    info.arrayLayers = 1;
+    info.samples = VK_SAMPLE_COUNT_1_BIT;
+    info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    info.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                 VK_IMAGE_USAGE_TRANSFER_SRC_BIT;   // transfer: GLINT_PICTURE_DUMP reads it back
+    info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    check_vk_result(vkCreateImage(g_Device, &info, g_Allocator, &im.image));
+    VkMemoryRequirements req;
+    vkGetImageMemoryRequirements(g_Device, im.image, &req);
+    VkMemoryAllocateInfo alloc = {};
+    alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    alloc.allocationSize = req.size;
+    alloc.memoryTypeIndex = find_memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    check_vk_result(vkAllocateMemory(g_Device, &alloc, g_Allocator, &im.memory));
+    check_vk_result(vkBindImageMemory(g_Device, im.image, im.memory, 0));
+    VkImageViewCreateInfo view = {};
+    view.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    view.image = im.image;
+    view.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    view.format = format;
+    view.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    view.subresourceRange.levelCount = 1;
+    view.subresourceRange.layerCount = 1;
+    check_vk_result(vkCreateImageView(g_Device, &view, g_Allocator, &im.view));
+    im.width = width;
+    im.height = height;
+    im.format = format;
+    return true;
+}
+
+// An input of a pass: an image read through a sampler.
+struct EnhanceInput { VkImageView view; VkSampler sampler; };
+
+// Points pipeline `pass` at its output and inputs (only when they changed).
+// Unused inputs repeat the first, so every binding is valid.
+static void enhance_bind(int pass, VkImageView out, EnhanceInput in0, EnhanceInput in1 = {}, EnhanceInput in2 = {})
+{
+    if (!in1.view) in1 = in0;
+    if (!in2.view) in2 = in0;
+    VkImageView want[4] = {out, in0.view, in1.view, in2.view};
+    if (std::memcmp(want, g_enh.bound[pass], sizeof(want)) == 0) return;
+    vkDeviceWaitIdle(g_Device);   // the set may be in use by a frame in flight
+    VkDescriptorImageInfo images[4] = {{VK_NULL_HANDLE, out, VK_IMAGE_LAYOUT_GENERAL},
+                                       {in0.sampler, in0.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+                                       {in1.sampler, in1.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+                                       {in2.sampler, in2.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
+    VkWriteDescriptorSet writes[4] = {};
+    for (int i = 0; i < 4; i++) {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = g_enh.sets[pass];
+        writes[i].dstBinding = (uint32_t)i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = i == 0 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[i].pImageInfo = &images[i];
+    }
+    vkUpdateDescriptorSets(g_Device, 4, writes, 0, nullptr);
+    std::memcpy(g_enh.bound[pass], want, sizeof(want));
+}
+
+static void enhance_dispatch(VkCommandBuffer cmd, int pass, EnhanceImage& out, const void* params, uint32_t bytes)
+{
+    layout_barrier(cmd, out.image, out.initialised ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
+                   VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_enh.pipelines[pass]);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_enh.pipeline_layout, 0, 1, &g_enh.sets[pass], 0,
+                            nullptr);
+    vkCmdPushConstants(cmd, g_enh.pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, bytes, params);
+    vkCmdDispatch(cmd, (uint32_t)(out.width + 15) / 16, (uint32_t)(out.height + 15) / 16, 1);
+    layout_barrier(cmd, out.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                   VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+    out.initialised = true;
+}
+
+static EnhanceImage& enhance_net_image(const char* name)
+{
+    for (int i = 0; i < kFsrcnnxImageCount; i++)
+        if (std::strcmp(kFsrcnnxImages[i], name) == 0) return g_enh.net[i];
+    return g_enh.net[0];   // not reached: gen_fsrcnnx.js only emits these names
+}
+
+// FSRCNNX: luma -> 13 network layers -> 2x picture in `ai2x`.
+static void enhance_record_ai(VkCommandBuffer cmd, int sw, int sh)
+{
+    for (EnhanceImage& im : g_enh.net) enhance_ensure_image(im, sw, sh, VK_FORMAT_R16G16B16A16_SFLOAT);
+    enhance_ensure_image(g_enh.ai2x, sw * 2, sh * 2);
+    struct { int32_t w, h; } size = {sw, sh};
+    enhance_bind(EnhanceAiLuma, enhance_net_image("LUMA").view, {g_enh.a.view, g_enh.nearest});
+    enhance_dispatch(cmd, EnhanceAiLuma, enhance_net_image("LUMA"), &size, sizeof(size));
+    for (int i = 0; i < kFsrcnnxLayerCount; i++) {
+        const FsrcnnxLayer& layer = kFsrcnnxLayers[i];
+        EnhanceInput in[3] = {};
+        for (int k = 0; k < 3; k++)
+            if (layer.binds[k]) in[k] = {enhance_net_image(layer.binds[k]).view, g_enh.nearest};
+        EnhanceImage& out = enhance_net_image(layer.save);
+        enhance_bind(EnhanceNet + i, out.view, in[0], in[1], in[2]);
+        enhance_dispatch(cmd, EnhanceNet + i, out, &size, sizeof(size));
+    }
+    enhance_bind(EnhanceAiOut, g_enh.ai2x.view, {enhance_net_image("SUBCONV1").view, g_enh.nearest},
+                 {g_enh.a.view, g_enh.linear});
+    enhance_dispatch(cmd, EnhanceAiOut, g_enh.ai2x, &size, sizeof(size));
+}
+
+static void enhance_record(VkCommandBuffer cmd, VideoTexture& tex)
+{
+    const EnhanceParams& p = g_enh.params;
+    if (!tex.live || !p.active || tex.width <= 0 || !enhance_init()) {
+        g_enh.shown = false;
+        return;
+    }
+    // Last frame's GPU time (its command buffer has finished: begin_once waited for it).
+    if (g_enh.query_pending) {
+        uint64_t t[2] = {};
+        if (vkGetQueryPoolResults(g_Device, g_enh.queries, 0, 2, sizeof(t), t, sizeof(uint64_t),
+                                  VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && t[1] >= t[0]) {
+            float ms = (float)((double)(t[1] - t[0]) * g_enh.timestamp_ns / 1e6);
+            g_enh.gpu_ms = g_enh.gpu_ms <= 0.0f ? ms : g_enh.gpu_ms * 0.9f + ms * 0.1f;
+        }
+        g_enh.query_pending = false;
+    }
+
+    const int sw = tex.width, sh = tex.height;
+    // Testing the upscalers on a screen no larger than the stream:
+    // GLINT_PICTURE_TARGET=3840x2160 forces the output size.
+    static int force_w = -1, force_h = 0;
+    if (force_w < 0) {
+        force_w = 0;
+        if (const char* e = std::getenv("GLINT_PICTURE_TARGET")) std::sscanf(e, "%dx%d", &force_w, &force_h);
+    }
+    // Upscale only when the window shows the picture larger than the stream
+    // (capped at 4K); otherwise the passes run at the stream's size.
+    int want_w = force_w > 0 ? force_w : g_enh.want_w, want_h = force_h > 0 ? force_h : g_enh.want_h;
+    // Resizing recreates the images (and waits for the GPU), so follow a
+    // changing size (zooming, dragging the window) only in 32-pixel steps and
+    // once it has held still for 0.15 s; meanwhile the last size is scaled.
+    {
+        static int held_w = 0, held_h = 0, pending_w = 0, pending_h = 0;
+        static double pending_since = 0.0;
+        int qw = (want_w + 16) / 32 * 32, qh = (want_h + 16) / 32 * 32;
+        double now = glfwGetTime();
+        if (held_w == 0 || !g_enh.out.image) {
+            held_w = qw; held_h = qh;
+        } else if (qw != held_w || qh != held_h) {
+            if (qw != pending_w || qh != pending_h) { pending_w = qw; pending_h = qh; pending_since = now; }
+            else if (now - pending_since > 0.15) { held_w = qw; held_h = qh; }
+        }
+        want_w = held_w;
+        want_h = held_h;
+    }
+    int tw = std::min(std::max(want_w, sw), 3840), th = std::min(std::max(want_h, sh), 2160);
+    bool scale = tw > sw + 1 || th > sh + 1;
+    if (!scale) { tw = sw; th = sh; }
+    // The AI upscaler doubles; like mpv's FSRCNNX it is only worth it from 1.3x
+    // on, below that Lanczos does as well.
+    int upscaler = p.upscaler;
+    if (upscaler == UpscaleAi && (!enhance_ai_available() || tw < sw * 1.3f || th < sh * 1.3f))
+        upscaler = UpscaleLanczos;
+    g_enh.used_upscaler = scale ? upscaler : -1;
+
+    enhance_ensure_image(g_enh.a, sw, sh);
+    if (enhance_ensure_image(g_enh.out, tw, th) || !g_enh.out_descriptor)
+        g_enh.out_descriptor = ImGui_ImplVulkan_AddTexture(g_enh.linear, g_enh.out.view,
+                                                           VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+    if (g_enh.queries) {
+        vkCmdResetQueryPool(cmd, g_enh.queries, 0, 2);
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g_enh.queries, 0);
+    }
+    g_enh.frame++;
+
+    enhance_bind(EnhancePre, g_enh.a.view, {tex.view, g_enh.nearest});
+    struct { int32_t w, h; float denoise, deband, exposure, saturation, shadows; uint32_t frame; } pre = {
+        sw, sh, p.denoise, p.deband, p.exposure, p.saturation, p.shadows, g_enh.frame};
+    enhance_dispatch(cmd, EnhancePre, g_enh.a, &pre, sizeof(pre));
+
+    EnhanceImage* processed = &g_enh.a;
+    if (scale) {
+        EnhanceImage* from = &g_enh.a;
+        int fw = sw, fh = sh;
+        if (upscaler == UpscaleAi) {
+            enhance_record_ai(cmd, sw, sh);
+            from = &g_enh.ai2x;
+            fw = sw * 2;
+            fh = sh * 2;
+        }
+        if (from->width == tw && from->height == th) {   // the AI's 2x is exactly the window
+            processed = from;
+        } else {
+            enhance_ensure_image(g_enh.b, tw, th);
+            struct { int32_t sw, sh, dw, dh, mode; } sc = {fw, fh, tw, th, upscaler == UpscaleBilinear ? 0 : 1};
+            if (upscaler == UpscaleFsr) {
+                enhance_bind(EnhanceEasu, g_enh.b.view, {from->view, g_enh.linear});
+                enhance_dispatch(cmd, EnhanceEasu, g_enh.b, &sc, 16);
+            } else {
+                enhance_bind(EnhanceScale, g_enh.b.view, {from->view, g_enh.linear});
+                enhance_dispatch(cmd, EnhanceScale, g_enh.b, &sc, sizeof(sc));
+            }
+            processed = &g_enh.b;
+        }
+    }
+
+    enhance_bind(EnhanceFinal, g_enh.out.view, {processed->view, g_enh.nearest}, {tex.view, g_enh.linear});
+    struct { int32_t w, h; float sharpness, dither, split; uint32_t frame; } fin = {
+        tw, th, p.sharpness, p.dither, g_compare.on ? 0.0f : g_enh.split, g_enh.frame};
+    enhance_dispatch(cmd, EnhanceFinal, g_enh.out, &fin, sizeof(fin));
+
+    if (g_enh.queries) {
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_enh.queries, 1);
+        g_enh.query_pending = true;
+    }
+    g_enh.shown = true;
+}
+
+// Testing: GLINT_PICTURE_DUMP=<folder> saves the enhanced picture as a PNG
+// every 300 frames (about 5 s), to inspect the upscalers pixel for pixel.
+static void enhance_dump_maybe()
+{
+    static const char* dir = std::getenv("GLINT_PICTURE_DUMP");
+    static uint32_t last = 0;
+    if (!dir || !g_enh.shown || !g_enh.out.image || g_enh.frame - last < 300) return;
+    last = g_enh.frame;
+    VideoTexture view;   // read_texture only needs the image and its size
+    view.image = g_enh.out.image;
+    view.width = g_enh.out.width;
+    view.height = g_enh.out.height;
+    std::vector<uint8_t> rgba;
+    std::string path, error;
+    if (read_texture(view, rgba) && glint::save_screenshot(dir, rgba, view.width, view.height, path, error))
+        glint::logf("picture dump: %s (%s, %.2f ms GPU)", path.c_str(),
+                    g_enh.used_upscaler >= 0 ? kUpscalerNames[g_enh.used_upscaler] : "no upscaling", g_enh.gpu_ms);
 }
 
 // Shows a decoded picture: GPU conversion when possible, else the CPU.
@@ -1923,6 +2448,28 @@ static void gallery_refresh(glint::App& app)
     g_gallery.loaded = true;
     g_thumbs.failed.clear();   // a file that was still being written may decode now
     g_thumbs.prune = true;
+    // A selected file that is gone (deleted outside Glint) is no longer selected.
+    if (!g_gallery.selected.empty() &&
+        std::none_of(g_gallery.items.begin(), g_gallery.items.end(),
+                     [](const glint::GalleryItem& it) { return it.path == g_gallery.selected; }))
+        g_gallery.selected.clear();
+}
+
+// The media folder is watched while the gallery is open, so files added,
+// deleted or renamed outside Glint (Explorer) show up too. A recording being
+// written changes it constantly: re-read at most once a second.
+static void gallery_follow_folder(glint::App& app)
+{
+    static glint::FolderWatch watch;
+    static double dirty_since = -1.0, last_refresh = -10.0;
+    watch.watch(app.media_dir());
+    double now = ImGui::GetTime();
+    if (watch.changed() && dirty_since < 0) dirty_since = now;
+    if (dirty_since >= 0 && now - last_refresh >= 1.0) {
+        g_gallery.loaded = false;
+        dirty_since = -1.0;
+        last_refresh = now;
+    }
 }
 
 static std::string base_name(const std::string& path)
@@ -2371,29 +2918,27 @@ static void draw_viewer(glint::App& app)
             ImGui::SetCursorScreenPos(ImVec2(vx + px(44), cy - px(13)));
             if (slider("##vvol", &vol, 0.0f, 2.0f, "%.0f%%", 100.0f, vol_w, player.has_audio())) player.set_volume(vol);
         } else if (have) {
-            // Bottom: zoom for screenshots.
-            float bh = px(44);
-            const char* labels[2] = {"Fit", "100%"};
-            float w1 = button_width(nullptr, labels[0]), w2 = button_width(nullptr, labels[1]);
-            float bw = w1 + w2 + px(6) * 3;
-            ImVec2 bp(vp->Pos.x + (vp->Size.x - bw) * 0.5f, vp->Pos.y + vp->Size.y - m - bh - px(6));
-            dl->AddRectFilled(bp, bp + ImVec2(bw, bh + px(12)), ink(C.glass), (bh + px(12)) * 0.5f);
-            dl->AddRect(bp, bp + ImVec2(bw, bh + px(12)), ink(C.glass_border), (bh + px(12)) * 0.5f);
-            on_controls |= ImGui::IsMouseHoveringRect(bp, bp + ImVec2(bw, bh + px(12)));
+            // Bottom: zoom for screenshots. A switch with one choice lit:
+            // Fit, 100 % (actual pixels), or neither while zoomed elsewhere.
+            // When the picture fits at 100 % (a 1080p screenshot on a 1080p
+            // screen) both are the same zoom, and Fit is the one lit.
+            static const char* labels[2] = {"Fit", "100%"};
             float one = 1.0f / fit;   // zoom at which one picture pixel is one screen pixel
-            bool at_fit = std::fabs(g_viewer.zoom - 1.0f) < 0.01f, at_one = std::fabs(g_viewer.zoom - one) < 0.01f;
-            ImGui::SetCursorScreenPos(bp + ImVec2(px(6), px(6)));
-            if (button("##vfit", nullptr, labels[0], at_fit ? Kind::GlassOn : Kind::Ghost, ImVec2(w1, bh))) {
-                g_viewer.zoom = 1.0f;
+            bool at_fit = std::fabs(g_viewer.zoom - 1.0f) < 0.01f;
+            bool at_one = !at_fit && std::fabs(g_viewer.zoom - one) < 0.01f;
+            int pick = at_fit ? 0 : at_one ? 1 : -1;
+            float sw = segmented_width(labels, 2, px(64));
+            float pad = px(6), h = px(34) + pad * 2;
+            ImVec2 bp(vp->Pos.x + (vp->Size.x - sw - pad * 2) * 0.5f, vp->Pos.y + vp->Size.y - m - h);
+            dl->AddRectFilled(bp, bp + ImVec2(sw + pad * 2, h), ink(C.glass), px(12));
+            dl->AddRect(bp, bp + ImVec2(sw + pad * 2, h), ink(C.glass_border), px(12));
+            on_controls |= ImGui::IsMouseHoveringRect(bp, bp + ImVec2(sw + pad * 2, h));
+            ImGui::SetCursorScreenPos(bp + ImVec2(pad, pad));
+            if (segmented("##vzoom", &pick, labels, 2, px(64))) {
+                g_viewer.zoom = pick == 0 ? 1.0f : std::max(1.0f, one);
                 g_viewer.pan = ImVec2(0, 0);
             }
-            tip("Fit the window  (double-click)");
-            ImGui::SetCursorScreenPos(bp + ImVec2(px(12) + w1, px(6)));
-            if (button("##vone", nullptr, labels[1], at_one ? Kind::GlassOn : Kind::Ghost, ImVec2(w2, bh))) {
-                g_viewer.zoom = std::max(1.0f, one);
-                g_viewer.pan = ImVec2(0, 0);
-            }
-            tip("Actual pixels  (scroll to zoom, drag to move)");
+            tip("Fit the window or show actual pixels. Scroll to zoom, drag to move, double-click to switch.");
         }
         ImGui::PopStyleVar();
     }
@@ -2401,6 +2946,17 @@ static void draw_viewer(glint::App& app)
     // Pointer on the picture: click plays/pauses a recording; on a screenshot,
     // scroll zooms around the pointer, drag pans, double-click toggles 100 %.
     bool on_picture = !on_controls && ImGui::IsWindowHovered() && !ImGui::IsAnyItemHovered() && !ImGui::IsAnyItemActive();
+    // Panning a zoomed screenshot, like any image viewer: press anywhere on
+    // the picture (not on the controls) and drag; it pans until the button is
+    // let go, even when the pointer crosses the controls.
+    static bool dragging = false;
+    if (have && !g_viewer.video && !on_controls && ImGui::IsWindowHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+        dragging = true;
+    if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) dragging = false;
+    if (dragging && g_viewer.zoom > 1.0f) {
+        g_viewer.pan = g_viewer.pan + io.MouseDelta;
+        ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeAll);
+    }
     if (on_picture && have) {
         if (g_viewer.video) {
             if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
@@ -2413,10 +2969,6 @@ static void draw_viewer(glint::App& app)
                 g_viewer.zoom = std::clamp(g_viewer.zoom * std::pow(1.2f, io.MouseWheel), 1.0f, std::max(8.0f, 4.0f / fit));
                 ImVec2 rel = io.MousePos - center - g_viewer.pan;
                 g_viewer.pan = g_viewer.pan - rel * (g_viewer.zoom / old - 1.0f);
-            }
-            if (ImGui::IsMouseDragging(ImGuiMouseButton_Left) && g_viewer.zoom > 1.0f) {
-                g_viewer.pan = g_viewer.pan + io.MouseDelta;
-                ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeAll);
             }
             if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
                 float one = 1.0f / fit;
@@ -2447,11 +2999,18 @@ static Link link_state(glint::App& app)
     return Link::Connecting;
 }
 
+// A failed link because another viewer took the stream (the console streams to
+// one viewer at a time), not because the console can't be reached.
+static bool watched_elsewhere(glint::App& app)
+{
+    return app.error().find("open in a browser or on another PC") != std::string::npos;
+}
+
 // Settings tabs. The gallery is its own overlay (draw_gallery).
 #if SL_LIVE_STREAMING
-enum Page { PageConsole, PageVideo, PageAudio, PageCapture, PageStreaming, PageHelp, PageCount };
+enum Page { PageConsole, PageVideo, PagePicture, PageAudio, PageCapture, PageStreaming, PageHelp, PageCount };
 #else
-enum Page { PageConsole, PageVideo, PageAudio, PageCapture, PageHelp, PageCount };
+enum Page { PageConsole, PageVideo, PagePicture, PageAudio, PageCapture, PageHelp, PageCount };
 #endif
 
 struct Shell {
@@ -2587,6 +3146,11 @@ static void handle_shortcuts(glint::App& app)
     }
     if (ImGui::IsKeyPressed(ImGuiKey_S, false)) do_screenshot(app);
     if (ImGui::IsKeyPressed(ImGuiKey_R, false)) toggle_local_recording(app);
+    if (ImGui::IsKeyPressed(ImGuiKey_C, false)) {
+        g_compare.on = !g_compare.on;
+        ui::toast(g_compare.on ? "Side by side: scroll to zoom, drag to move. X to tweak, C to leave." : "Side by side off", 0);
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_X, false) && g_compare.on) g_tweaks_open = !g_tweaks_open;
 }
 
 // ---------------------------------------------------------------------------
@@ -2615,7 +3179,7 @@ static void page_console(glint::App& app)
 
         Link link = link_state(app);
         const char* state = link == Link::Live ? "Live" : link == Link::Connecting ? "Connecting"
-                          : link == Link::Failed ? "Unreachable" : "Offline";
+                          : link == Link::Failed ? (watched_elsewhere(app) ? "Elsewhere" : "Unreachable") : "Offline";
         ImU32 fg = link == Link::Live ? C.success : link == Link::Connecting ? C.warn
                  : link == Link::Failed ? C.danger : C.faint;
         ImU32 bg = link == Link::Live ? C.success_soft : link == Link::Connecting ? C.warn_soft
@@ -2650,8 +3214,7 @@ static void page_console(glint::App& app)
         row_end();
         float rx_fps = 0.0f, rx_kbps = 0.0f;
         app.received_rate(rx_fps, rx_kbps);
-        std::snprintf(line, sizeof(line), "%.1f fps, %.2f Mbit/s received (last 2 s), %d viewer(s) on the console",
-                      rx_fps, rx_kbps / 1000.0, status.clients);
+        std::snprintf(line, sizeof(line), "%.1f fps, %.2f Mbit/s received (last 2 s)", rx_fps, rx_kbps / 1000.0);
         row_begin("Throughput", line, 0, 20);
         row_end();
         std::snprintf(line, sizeof(line), "%llu frames decoded since connecting",
@@ -2722,6 +3285,509 @@ static std::string driver_version_text(const VkPhysicalDeviceProperties& p)
 static std::string conversion_in_use(glint::App& app)
 {
     return app.gpu_convert() && g_yuv.available ? "Vulkan YUV (GPU)" : (g_yuv.tried && !g_yuv.available ? "CPU (GPU unavailable)" : "CPU");
+}
+
+// ---------------------------------------------------------------------------
+// Settings -> Picture: the enhancement passes (g_enh). A profile picks a set of
+// values; touching any control switches to Custom with the values shown. With
+// "Protect frame time" the profile steps down while the passes take longer
+// than the GPU budget (measured each frame), so a weak GPU never drops frames.
+// ---------------------------------------------------------------------------
+
+enum { PictureOff, PictureLight, PictureBalanced, PictureEnhanced, PictureCustom };
+static const char* const kPictureProfiles[] = {"Off", "Light", "Balanced", "Enhanced", "Custom"};
+static const char* const* const kUpscalers = kUpscalerNames;
+constexpr int kUpscalerCount = 4;
+
+static glint::PictureSettings g_picture;
+static std::vector<glint::PicturePreset> g_picture_presets;   // the user's own, saved in picture.conf
+static std::string g_picture_active;   // the user preset applied (Custom started from it), "" for a built-in profile
+static int g_picture_step = 0;              // profiles stepped down by "Protect frame time"
+static int g_picture_step_profile = -1;     // the profile the step belongs to
+static double g_picture_over_since = -1.0;
+
+// The values a profile stands for (colour stays neutral; Custom keeps its own).
+static glint::PictureSettings picture_preset(int profile)
+{
+    glint::PictureSettings s;
+    s.exposure = 0.0f;
+    s.saturation = 1.0f;
+    s.shadows = 0.0f;
+    switch (profile) {
+    case PictureLight:
+        s.upscaler = 0; s.sharpness = 0.25f; s.denoise = 0.0f; s.deband = 0.0f; s.dither = 0.0f;
+        break;
+    case PictureEnhanced:
+        s.upscaler = UpscaleAi; s.sharpness = 0.45f; s.denoise = 0.15f; s.deband = 0.35f; s.dither = 0.5f;
+        break;
+    default:   // Balanced
+        s.upscaler = UpscaleFsr; s.sharpness = 0.35f; s.denoise = 0.0f; s.deband = 0.25f; s.dither = 0.5f;
+        break;
+    }
+    return s;
+}
+
+// The values in effect: the profile's, or Custom's, after any step-down.
+static glint::PictureSettings picture_effective()
+{
+    glint::PictureSettings v = g_picture.profile == PictureCustom ? g_picture : picture_preset(g_picture.profile);
+    if (g_picture_step > 0) {
+        if (g_picture.profile == PictureCustom) {
+            v.upscaler = std::max(0, v.upscaler - g_picture_step);
+            if (g_picture_step >= 1) v.denoise = 0.0f;
+            if (g_picture_step >= 2) v.deband = 0.0f;
+        } else {
+            v = picture_preset(std::max((int)PictureLight, g_picture.profile - g_picture_step));
+        }
+    }
+    v.upscaler = std::clamp(v.upscaler, 0, kUpscalerCount - 1);
+    return v;
+}
+
+// Once per frame, before the upload: resolves the passes and runs the
+// frame-time protection.
+static void picture_update()
+{
+    if (g_picture_step_profile != g_picture.profile) {   // a new profile starts at full strength
+        g_picture_step = 0;
+        g_picture_step_profile = g_picture.profile;
+        g_picture_over_since = -1.0;
+    }
+    if (g_picture.profile != PictureOff && g_picture.protect && g_enh.shown && g_enh.gpu_ms > g_picture.budget_ms) {
+        double now = ImGui::GetTime();
+        if (g_picture_over_since < 0) g_picture_over_since = now;
+        int floor_step = g_picture.profile == PictureCustom ? 2 : g_picture.profile - PictureLight;
+        if (now - g_picture_over_since > 1.5 && g_picture_step < floor_step) {
+            g_picture_step++;
+            g_picture_over_since = -1.0;
+            g_enh.gpu_ms = 0.0f;   // measure the lighter set afresh
+            glint::logf("picture: GPU over its %.1f ms budget; stepped down %d", g_picture.budget_ms, g_picture_step);
+        }
+    } else {
+        g_picture_over_since = -1.0;
+    }
+
+    EnhanceParams e;
+    e.active = g_picture.profile != PictureOff;
+    if (e.active) {
+        glint::PictureSettings v = picture_effective();
+        e.upscaler = v.upscaler;
+        e.sharpness = v.sharpness;
+        e.denoise = v.denoise;
+        e.deband = v.deband;
+        e.dither = v.dither;
+        e.exposure = v.exposure;
+        e.saturation = v.saturation;
+        e.shadows = v.shadows;
+    }
+    g_enh.params = e;
+}
+
+// Picture values only (not the profile, protection or budget).
+static bool picture_same(const glint::PictureSettings& a, const glint::PictureSettings& b)
+{
+    return a.upscaler == b.upscaler && a.sharpness == b.sharpness && a.denoise == b.denoise && a.deband == b.deband &&
+           a.dither == b.dither && a.exposure == b.exposure && a.saturation == b.saturation && a.shadows == b.shadows;
+}
+
+static glint::PicturePreset* picture_find(const std::string& name)
+{
+    for (glint::PicturePreset& p : g_picture_presets)
+        if (p.name == name) return &p;
+    return nullptr;
+}
+
+// How a user preset relates to what is on now.
+enum class PresetState { Other, Applied, Changed };
+static PresetState preset_state(const glint::PicturePreset& p)
+{
+    if (g_picture_active != p.name || g_picture.profile != PictureCustom) return PresetState::Other;
+    return picture_same(g_picture, p.values) ? PresetState::Applied : PresetState::Changed;
+}
+
+// Makes `values` the Custom profile (keeping protection and budget).
+static void picture_set_custom(const glint::PictureSettings& values)
+{
+    glint::PictureSettings v = values;
+    v.profile = PictureCustom;
+    v.protect = g_picture.protect;
+    v.budget_ms = g_picture.budget_ms;
+    g_picture = v;
+    g_picture_step = 0;
+    g_picture_step_profile = PictureCustom;
+}
+
+static void picture_apply_preset(const glint::PicturePreset& p)
+{
+    picture_set_custom(p.values);
+    g_picture_active = p.name;
+    ui::toast("Applied preset \"" + p.name + "\"", 0);
+}
+
+// What the Profile row says about the profile in use.
+static std::string picture_profile_desc()
+{
+    static const char* const hints[] = {
+        "The picture as it comes from the console.",
+        "Bilinear upscaling and light sharpening. For older or integrated GPUs.",
+        "FSR 1 upscaling, sharpening and debanding.",
+        "AI upscaling, denoising and everything else. For a strong GPU.",
+        "Your own values.",
+    };
+    if (g_picture.profile == PictureCustom && !g_picture_active.empty()) {
+        if (glint::PicturePreset* p = picture_find(g_picture_active))
+            return "Your preset \"" + p->name + "\"" +
+                   (preset_state(*p) == PresetState::Changed ? ", changed (not saved)." : ".");
+    }
+    return hints[g_picture.profile];
+}
+
+// The profile switch. A built-in profile ends any applied user preset.
+static void picture_profile_control(float min_item)
+{
+    using namespace ui;
+    int prof = g_picture.profile;
+    if (segmented("##pprofile", &prof, kPictureProfiles, 5, min_item) && prof != g_picture.profile) {
+        g_picture.profile = prof;
+        if (prof != PictureCustom) g_picture_active.clear();
+    }
+}
+
+// The tweaking controls, shared by Settings -> Picture (rows) and the side by
+// side panel (columns). Every control shows the values in effect; changing
+// one makes them the Custom profile. An applied preset stays the one in use,
+// now marked changed until it is updated or reverted.
+enum { TweakUpscaler, TweakSharpness, TweakDenoise, TweakDeband, TweakDither, TweakExposure, TweakSaturation,
+       TweakShadows, TweakCount };
+static void picture_tweak(int which, glint::PictureSettings& v, float width)
+{
+    using namespace ui;
+    switch (which) {
+    case TweakUpscaler:  segmented("##pup", &v.upscaler, kUpscalers, kUpscalerCount, width / kUpscalerCount); break;
+    case TweakSharpness: slider("##psharp", &v.sharpness, 0.0f, 1.0f, "%.0f%%", 100.0f, width); break;
+    case TweakDenoise:   slider("##pdenoise", &v.denoise, 0.0f, 1.0f, "%.0f%%", 100.0f, width); break;
+    case TweakDeband:    slider("##pdeband", &v.deband, 0.0f, 1.0f, "%.0f%%", 100.0f, width); break;
+    case TweakDither:    slider("##pdither", &v.dither, 0.0f, 1.0f, "%.0f%%", 100.0f, width); break;
+    case TweakExposure:  slider("##pexp", &v.exposure, -2.0f, 2.0f, "%+.1f", 1.0f, width); break;
+    case TweakSaturation: slider("##psat", &v.saturation, 0.0f, 2.0f, "%.0f%%", 100.0f, width); break;
+    default:             slider("##pshadow", &v.shadows, 0.0f, 1.0f, "%.0f%%", 100.0f, width); break;
+    }
+}
+static const char* const kTweakNames[TweakCount] = {"Upscaler", "Sharpness",  "Denoise",    "Debanding",
+                                                    "Dithering", "Exposure", "Saturation", "Shadow detail"};
+
+// Commits edited values (if any) as Custom.
+static void picture_commit(const glint::PictureSettings& v, const glint::PictureSettings& before)
+{
+    if (!picture_same(v, before)) picture_set_custom(v);
+}
+
+static void page_picture(glint::App& app)
+{
+    using namespace ui;
+    (void)app;
+    section("Profile");
+    card_begin();
+    {
+        std::string desc = picture_profile_desc();
+        row_begin("Profile", desc.c_str(), segmented_width(kPictureProfiles, 5, px(70)));
+        picture_profile_control(px(70));
+        row_end();
+
+        char status[160];
+        if (g_picture.profile == PictureOff)
+            std::snprintf(status, sizeof(status), "Off");
+        else if (!g_enh.shown)
+            std::snprintf(status, sizeof(status), g_enh.tried && !g_enh.available ? "Not available on this GPU"
+                                                                                  : "Waiting for video");
+        else {
+            const char* up = g_enh.used_upscaler >= 0 ? kUpscalers[g_enh.used_upscaler] : "no upscaling";
+            if (g_enh.timestamp_ns > 0)
+                std::snprintf(status, sizeof(status), "%.2f ms GPU  -  %d x %d  -  %s", g_enh.gpu_ms, g_enh.out.width,
+                              g_enh.out.height, up);
+            else
+                std::snprintf(status, sizeof(status), "%d x %d  -  %s", g_enh.out.width, g_enh.out.height, up);
+        }
+        const char* sdesc = g_picture_step > 0 ? "Stepped down: the GPU went over its budget." : nullptr;
+        ImGui::PushFont(F.mono);
+        float sw = ImGui::CalcTextSize(status).x;
+        ImGui::PopFont();
+        row_begin("Status", sdesc, sw, 20);
+        ImGui::PushFont(F.mono);
+        text_colored(C.muted, "%s", status);
+        ImGui::PopFont();
+        row_end();
+    }
+    card_end();
+
+    // My presets: the values below saved under a name. The one in use is
+    // marked Applied, or Changed once a control moved away from it.
+    section("My presets");
+    card_begin();
+    {
+        const glint::PictureSettings current =
+            g_picture.profile == PictureCustom ? g_picture : picture_preset(g_picture.profile);
+        int remove = -1;
+        for (size_t i = 0; i < g_picture_presets.size(); i++) {
+            glint::PicturePreset& pr = g_picture_presets[i];
+            const glint::PictureSettings& v = pr.values;
+            PresetState st = preset_state(pr);
+            char desc[200];
+            std::snprintf(desc, sizeof(desc), "%s, sharpness %.0f%%, denoise %.0f%%, deband %.0f%%%s",
+                          kUpscalers[std::clamp(v.upscaler, 0, kUpscalerCount - 1)], v.sharpness * 100,
+                          v.denoise * 100, v.deband * 100,
+                          v.exposure != 0 || v.saturation != 1 || v.shadows != 0 ? ", own colour" : "");
+            const float dw = button_width(icon::trash, "Delete");
+            const float lw = button_width(nullptr, "Apply"), uw = button_width(nullptr, "Update"),
+                        rw = button_width(nullptr, "Revert");
+            const char* badge_text = st == PresetState::Applied ? "Applied" : st == PresetState::Changed ? "Changed" : nullptr;
+            float bw = badge_text ? badge_width(badge_text) + px(10) : 0.0f;
+            float controls = bw + (st == PresetState::Changed ? uw + px(8) + rw + px(8)
+                                   : st == PresetState::Other ? lw + px(8) : 0.0f) + dw;
+            ImGui::PushID((int)i);
+            row_begin(pr.name.c_str(), desc, controls, 36);
+            if (badge_text) {
+                ImVec2 bp = ImGui::GetCursorScreenPos();
+                ImGui::PushFont(F.label);
+                float badge_h = ImGui::GetFontSize() + px(8);
+                ImGui::PopFont();
+                ImGui::SetCursorScreenPos(bp + ImVec2(0, (px(36) - badge_h) * 0.5f));
+                if (st == PresetState::Applied) badge(badge_text, C.success, C.success_soft, false);
+                else badge(badge_text, C.warn, C.warn_soft, false);
+                ImGui::SetCursorScreenPos(bp + ImVec2(bw, 0));
+            }
+            if (st == PresetState::Other) {
+                if (button("##papply", nullptr, "Apply", Kind::Secondary, ImVec2(lw, 0))) picture_apply_preset(pr);
+                tip("Use this preset");
+                ImGui::SameLine(0, px(8));
+            } else if (st == PresetState::Changed) {
+                if (button("##pupdate", nullptr, "Update", Kind::Primary, ImVec2(uw, 0))) {
+                    pr.values = current;
+                    pr.values.profile = PictureCustom;
+                    ui::toast("Updated preset \"" + pr.name + "\"", 1);
+                }
+                tip("Save the current values into this preset");
+                ImGui::SameLine(0, px(8));
+                if (button("##prevert", nullptr, "Revert", Kind::Secondary, ImVec2(rw, 0))) picture_apply_preset(pr);
+                tip("Back to the preset as saved");
+                ImGui::SameLine(0, px(8));
+            }
+            if (button("##pdel", icon::trash, "Delete", Kind::Ghost, ImVec2(dw, 0))) remove = (int)i;
+            row_end();
+            ImGui::PopID();
+        }
+        if (remove >= 0) {
+            ui::toast("Deleted preset \"" + g_picture_presets[remove].name + "\"", 0);
+            if (g_picture_active == g_picture_presets[remove].name) g_picture_active.clear();
+            g_picture_presets.erase(g_picture_presets.begin() + remove);
+        }
+
+        static char name[48] = "";
+        std::string trimmed(name);
+        trimmed.erase(0, trimmed.find_first_not_of(' '));
+        trimmed.erase(trimmed.find_last_not_of(' ') + 1);
+        glint::PicturePreset* existing = picture_find(trimmed);
+        bool full = (int)g_picture_presets.size() >= glint::kMaxPicturePresets && !existing;
+        bool can_save = !trimmed.empty() && !full && g_picture.profile != PictureOff;
+        const char* save_label = existing ? "Replace" : "Save";
+        float sbw = button_width(icon::add, save_label);
+        const char* save_desc = g_picture.profile == PictureOff ? "Turn the picture on to save its values."
+                              : full ? "You have 20 presets: delete one to save another."
+                              : existing ? "A preset with this name exists: Replace overwrites it."
+                              : "Saves the values below under a name and applies it.";
+        row_begin("Save current settings", save_desc, px(220) + px(8) + sbw, 36);
+        bool enter = input("##pname", name, sizeof(name), px(220), g_picture.profile != PictureOff,
+                           ImGuiInputTextFlags_EnterReturnsTrue);
+        ImGui::SameLine(0, px(8));
+        if ((button("##psave", icon::add, save_label, Kind::Primary, ImVec2(sbw, 0), can_save) || (enter && can_save))) {
+            glint::PicturePreset pr;
+            pr.name = trimmed;
+            pr.values = current;
+            pr.values.profile = PictureCustom;
+            if (existing) *existing = pr;
+            else g_picture_presets.push_back(pr);
+            picture_set_custom(current);   // saved = applied
+            g_picture_active = trimmed;
+            ui::toast("Saved preset \"" + trimmed + "\"", 1);
+            name[0] = 0;
+        }
+        row_end();
+        if (g_picture_presets.empty())
+            card_note(C.muted, "No presets yet. Set things up below, give it a name and save it here.");
+    }
+    card_end();
+
+    section("Compare");
+    card_begin();
+    {
+        row_begin("Side by side",
+                  "The same spot twice, original and enhanced. Scroll to zoom, drag to move, double-click to reset. "
+                  "X opens the controls over it.  (C)",
+                  px(40), 22);
+        if (toggle("##pside", &g_compare.on) && g_compare.on) {
+            g_shell.settings_open = false;   // the comparison needs the whole window
+            ui::toast("Side by side: scroll to zoom, drag to move. X to tweak, C to leave.", 0);
+        }
+        row_end();
+    }
+    card_end();
+
+    glint::PictureSettings v = picture_effective();
+    const glint::PictureSettings before = v;
+    const float sw = px(260);
+    static const char* const tips[TweakCount] = {
+        nullptr,
+        "Contrast-adaptive: sharpens soft detail, leaves flat areas and edges alone.",
+        "Edge-preserving. Smooths speckle in flat areas.",
+        "Smooths the steps in skies and gradients.",
+        "A hint of noise so gradients don't show steps.",
+        "In stops (EV).",
+        nullptr,
+        "Lifts dark areas, leaves the rest.",
+    };
+    static const char* const up_hints[] = {
+        "Smooth and cheapest.", "Sharper edges, no halos.", "AMD FidelityFX FSR 1: edge-adaptive, clean lines.",
+        "FSRCNNX neural network: rebuilds fine detail. Used from 1.3x, else Lanczos."};
+    auto tweak_row = [&](int which) {
+        float w = which == TweakUpscaler ? segmented_width(kUpscalers, kUpscalerCount, px(72)) : sw;
+        row_begin(kTweakNames[which], which == TweakUpscaler ? up_hints[v.upscaler] : tips[which], w);
+        picture_tweak(which, v, which == TweakUpscaler ? px(72) * kUpscalerCount : sw);
+        row_end();
+    };
+
+    section("Upscaling and sharpening");
+    card_begin();
+    tweak_row(TweakUpscaler);
+    tweak_row(TweakSharpness);
+    card_note(C.muted, "Upscaling applies when the picture is shown larger than the stream (1080p).");
+    card_end();
+
+    section("Compression cleanup");
+    card_begin();
+    tweak_row(TweakDenoise);
+    tweak_row(TweakDeband);
+    tweak_row(TweakDither);
+    card_end();
+
+    section("Color");
+    card_begin();
+    tweak_row(TweakExposure);
+    tweak_row(TweakSaturation);
+    tweak_row(TweakShadows);
+    card_note(C.muted, "None of these bring back detail lost to compression.");
+    card_end();
+
+    picture_commit(v, before);
+
+    section("Frame time");
+    card_begin();
+    {
+        row_begin("Protect frame time", "Steps the profile down when the passes take longer than the budget.", px(40),
+                  22);
+        toggle("##pprotect", &g_picture.protect);
+        row_end();
+        row_begin("GPU budget", "Time the passes may take per frame.", sw);
+        slider("##pbudget", &g_picture.budget_ms, 0.5f, 10.0f, "%.1f ms", 1.0f, sw, g_picture.protect);
+        row_end();
+        float bw = button_width(icon::refresh, "Reset");
+        row_begin("Profile defaults", "Back to Balanced with neutral colour.", bw, 36);
+        if (button("##preset", icon::refresh, "Reset", Kind::Secondary, ImVec2(bw, 0))) {
+            glint::PictureSettings d;
+            d.protect = g_picture.protect;
+            d.budget_ms = g_picture.budget_ms;
+            g_picture = d;
+            g_picture_active.clear();
+        }
+        row_end();
+    }
+    card_end();
+}
+
+// Side by side's control panel (X): the tweaks laid out in columns along the
+// bottom, over the picture without dimming it, so every change shows at once
+// (g_tweaks_open, with g_compare).
+
+static void draw_picture_tweaks(ImVec2 vp_pos, ImVec2 vp_size)
+{
+    using namespace ui;
+    if (!g_compare.on) g_tweaks_open = false;
+    float t = anim(ImGui::GetID("##tweaks_open"), g_tweaks_open ? 1.0f : 0.0f, 14.0f);
+    if (t < 0.01f) return;
+
+    // A fixed-width panel centred at the bottom: a top row (profile, upscaler,
+    // close), a line saying what is in use, then the sliders in a 4 x 2 grid.
+    const float pad = px(20), gap = px(22), row_h = px(34);
+    const int cols = 4;
+    const float width = std::min(vp_size.x - px(32), px(1080));
+    const float cell_w = (width - pad * 2 - gap * (cols - 1)) / cols;
+    const float cell_h = px(58);
+    const float height = pad + row_h + px(30) + cell_h * 2 + px(6) + pad;
+    ImVec2 size(width, height);
+    ImVec2 pos(vp_pos.x + (vp_size.x - width) * 0.5f,
+               vp_pos.y + vp_size.y - px(16) - height + (1.0f - ease_out(t)) * (height + px(32)));
+    ImGui::SetNextWindowPos(pos);
+    ImGui::SetNextWindowSize(size);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ImGui::GetStyle().Alpha * std::min(1.0f, t * 1.5f));
+    ImGui::Begin("##tweaks", nullptr,
+                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
+                     ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollWithMouse);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(pos + ImVec2(0, px(6)), pos + size + ImVec2(0, px(8)), ImGui::GetColorU32(C.shadow, 0.5f), px(16));
+    dl->AddRectFilled(pos, pos + size, ink(C.glass), px(16));
+    dl->AddRect(pos, pos + size, ink(C.glass_border), px(16));
+    if (ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem) || ImGui::IsAnyItemActive())
+        g_shell.pointer_on_controls = true;   // the comparison ignores the mouse here
+
+    glint::PictureSettings v = picture_effective();
+    const glint::PictureSettings before = v;
+
+    // Top row.
+    ImVec2 o = pos + ImVec2(pad, pad);
+    ImGui::SetCursorScreenPos(o);
+    picture_profile_control(px(64));
+    float x = o.x + segmented_width(kPictureProfiles, 5, px(64)) + px(14);
+    ImGui::SetCursorScreenPos(ImVec2(x, o.y));
+    picture_tweak(TweakUpscaler, v, px(64) * kUpscalerCount);
+    float close_w = button_width(icon::close, "Close");
+    ImGui::SetCursorScreenPos(ImVec2(pos.x + width - pad - close_w, o.y));
+    if (button("##tclose", icon::close, "Close", Kind::Ghost, ImVec2(close_w, row_h))) g_tweaks_open = false;
+    tip("Close the controls  (X)");
+
+    // What is in use, under the top row.
+    std::string state = picture_profile_desc();
+    if (g_enh.shown && g_enh.used_upscaler >= 0) state += "  Upscaling with " + std::string(kUpscalers[g_enh.used_upscaler]) + ".";
+    else if (g_picture.profile != PictureOff) state += "  Zoom in to see the upscaler.";
+    ImGui::PushFont(F.small);
+    dl->AddText(ImVec2(o.x, o.y + row_h + px(8)), ink(C.muted), state.c_str());
+    ImGui::PopFont();
+
+    // The grid: name above, slider (with its value) below.
+    static const int grid[cols * 2] = {TweakSharpness, TweakDenoise, TweakDeband,   TweakDither,
+                                       TweakExposure,  TweakSaturation, TweakShadows, -1};
+    float gy = o.y + row_h + px(30);
+    for (int i = 0; i < cols * 2; i++) {
+        float cx = o.x + (i % cols) * (cell_w + gap), cy = gy + (i / cols) * cell_h;
+        if (grid[i] < 0) {   // the last cell: back to the profile's own values
+            float rw = button_width(icon::refresh, "Reset");
+            ImGui::SetCursorScreenPos(ImVec2(cx + cell_w - rw, cy + px(18)));
+            if (button("##treset", icon::refresh, "Reset", Kind::Secondary, ImVec2(rw, row_h)))
+                v = g_picture.profile == PictureCustom ? picture_preset(PictureBalanced) : picture_preset(g_picture.profile);
+            tip("Back to the profile's values");
+            continue;
+        }
+        ImGui::PushFont(F.label);
+        dl->AddText(ImVec2(cx, cy), ink(C.text), kTweakNames[grid[i]]);
+        ImGui::PopFont();
+        ImGui::SetCursorScreenPos(ImVec2(cx, cy + px(22)));
+        ImGui::PushID(grid[i]);
+        picture_tweak(grid[i], v, cell_w);
+        ImGui::PopID();
+    }
+
+    picture_commit(v, before);
+    ImGui::End();
+    ImGui::PopStyleVar(2);
 }
 
 static void page_video(glint::App& app)
@@ -3112,6 +4178,7 @@ static void draw_gallery(glint::App& app)
         ImGui::EndPopup();
         return;
     }
+    gallery_follow_folder(app);
     if (!g_gallery.loaded) gallery_refresh(app);
 
     float e = ease_out(g_shell.gallery_t);
@@ -4064,9 +5131,9 @@ static void draw_settings(glint::App& app)
     // Tabs: text on a hairline, no rounding. The active tab is full-strength
     // with a 2 px underline.
 #if SL_LIVE_STREAMING
-    static const char* tabs[PageCount] = {"Console", "Video", "Audio", "Capture", "Streaming", "Help"};
+    static const char* tabs[PageCount] = {"Console", "Video", "Picture", "Audio", "Capture", "Streaming", "Help"};
 #else
-    static const char* tabs[PageCount] = {"Console", "Video", "Audio", "Capture", "Help"};
+    static const char* tabs[PageCount] = {"Console", "Video", "Picture", "Audio", "Capture", "Help"};
 #endif
     ImVec2 tp = origin + ImVec2(px(24), px(64));
     float th = px(44);
@@ -4118,6 +5185,7 @@ static void draw_settings(glint::App& app)
     switch (g_shell.page) {
     case PageConsole: page_console(app); break;
     case PageVideo: page_video(app); break;
+    case PagePicture: page_picture(app); break;
     case PageAudio: page_audio(app); break;
     case PageCapture: page_capture(app); break;
 #if SL_LIVE_STREAMING
@@ -4148,11 +5216,99 @@ static void draw_settings(glint::App& app)
 // Player view
 // ---------------------------------------------------------------------------
 
+// Side by side: two panels showing the same part of the picture, the original
+// on the left and the enhanced one on the right. Scroll zooms around the
+// pointer, dragging pans, a double-click goes back to the whole picture.
+static void draw_compare(const VideoTexture& texture, ImVec2 pos, ImVec2 size)
+{
+    using namespace ui;
+    ImDrawList* dl = ImGui::GetBackgroundDrawList();
+    dl->AddRectFilled(pos, pos + size, IM_COL32(0, 0, 0, 255));
+    Compare& c = g_compare;
+    const float gap = px(2);
+    const float pw = (size.x - gap) * 0.5f, ph = size.y;
+    const float aspect = (float)texture.width / texture.height;
+    // The whole picture's size on screen at this zoom.
+    const float fit_w = std::min(pw, ph * aspect), fit_h = fit_w / aspect;
+    const float W = fit_w * c.zoom, H = fit_h * c.zoom;
+    // The part of it a panel shows (UV), and where that sits in the panel.
+    const float uw = std::min(1.0f, pw / W), uh = std::min(1.0f, ph / H);
+    c.center.x = std::clamp(c.center.x, uw * 0.5f, 1.0f - uw * 0.5f);
+    c.center.y = std::clamp(c.center.y, uh * 0.5f, 1.0f - uh * 0.5f);
+    const ImVec2 uv0(c.center.x - uw * 0.5f, c.center.y - uh * 0.5f), uv1(c.center.x + uw * 0.5f, c.center.y + uh * 0.5f);
+    const ImVec2 shown(uw * W, uh * H);
+    const ImVec2 left = pos + ImVec2((pw - shown.x) * 0.5f, (ph - shown.y) * 0.5f);
+    const ImVec2 right = left + ImVec2(pw + gap, 0);
+
+    // The enhancement upscales to the zoomed size, so a zoomed-in view shows
+    // what the upscaler really does at that size (capped at 4K by the passes).
+    ImVec2 fb = ImGui::GetIO().DisplayFramebufferScale;
+    g_enh.want_w = (int)std::lround(W * fb.x);
+    g_enh.want_h = (int)std::lround(H * fb.y);
+
+    dl->AddImage(texture.im_id(), left, left + shown, uv0, uv1);
+    bool enhanced = g_enh.shown && g_enh.out_descriptor;
+    dl->AddImage(enhanced ? (ImTextureID)(intptr_t)g_enh.out_descriptor : texture.im_id(), right, right + shown, uv0,
+                 uv1);
+    dl->AddRectFilled(pos + ImVec2(pw, 0), pos + ImVec2(pw + gap, ph), ink(C.glass_border));
+
+    // Labels.
+    char label[64];
+    if (!enhanced) std::snprintf(label, sizeof(label), "Enhanced: Picture is Off");
+    else if (g_enh.used_upscaler >= 0) std::snprintf(label, sizeof(label), "Enhanced  -  %s", kUpscalerNames[g_enh.used_upscaler]);
+    else std::snprintf(label, sizeof(label), "Enhanced");
+    char zoom[160];
+    std::snprintf(zoom, sizeof(zoom), "%.1fx  -  scroll to zoom, drag to move, double-click to reset  -  X to tweak, C to leave", c.zoom);
+    ImGui::PushFont(F.label);
+    auto pill = [&](ImVec2 p, const char* text) {
+        ImVec2 ts = ImGui::CalcTextSize(text);
+        dl->AddRectFilled(p, p + ts + ImVec2(px(20), px(12)), ink(C.glass), px(8));
+        dl->AddText(p + ImVec2(px(10), px(6)), ink(C.text), text);
+    };
+    // Below the status pill and the round buttons; the hint at the top centre,
+    // clear of the command bar.
+    pill(pos + ImVec2(px(20), px(80)), "Original");
+    pill(pos + ImVec2(pw + gap + px(20), px(80)), label);
+    ImVec2 zs = ImGui::CalcTextSize(zoom);
+    pill(pos + ImVec2((size.x - zs.x) * 0.5f - px(10), px(22)), zoom);
+    ImGui::PopFont();
+
+    // Input, only over the picture (not over controls, Settings or the gallery).
+    ImGuiIO& io = ImGui::GetIO();
+    bool free = !g_shell.pointer_on_controls && !g_shell.settings_open && !g_shell.gallery_open && !g_viewer.open;
+    ImVec2 m = io.MousePos;
+    auto inside = [&](ImVec2 a) { return m.x >= a.x && m.y >= a.y && m.x < a.x + shown.x && m.y < a.y + shown.y; };
+    bool over = free && (inside(left) || inside(right));
+    if (over && io.MouseWheel != 0.0f) {
+        ImVec2 o = inside(left) ? left : right;
+        ImVec2 f((m.x - o.x) / shown.x, (m.y - o.y) / shown.y);   // where the pointer is, 0..1 of the view
+        ImVec2 at(uv0.x + f.x * uw, uv0.y + f.y * uh);          // ...in picture UV: keep it under the pointer
+        c.zoom = std::clamp(c.zoom * std::pow(1.25f, io.MouseWheel), 1.0f, 8.0f);
+        float nw = std::min(1.0f, pw / (fit_w * c.zoom)), nh = std::min(1.0f, ph / (fit_h * c.zoom));
+        c.center = ImVec2(at.x - (f.x - 0.5f) * nw, at.y - (f.y - 0.5f) * nh);
+    }
+    if (over && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) c.dragging = true;
+    if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) c.dragging = false;
+    if (c.dragging) {
+        c.center.x -= io.MouseDelta.x / W;
+        c.center.y -= io.MouseDelta.y / H;
+        ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeAll);
+    }
+    if (over && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+        c.zoom = 1.0f;
+        c.center = ImVec2(0.5f, 0.5f);
+    }
+}
+
 static void draw_video(const VideoTexture& texture, ImVec2 pos, ImVec2 size)
 {
     ImDrawList* dl = ImGui::GetBackgroundDrawList();
     if (!texture.descriptor || texture.width <= 0 || texture.height <= 0) {
         dl->AddRectFilled(pos, pos + size, ui::C.panel);   // the connect screen's ground
+        return;
+    }
+    if (g_compare.on) {
+        draw_compare(texture, pos, size);
         return;
     }
     dl->AddRectFilled(pos, pos + size, IM_COL32(0, 0, 0, 255));   // letterbox stays black in both themes
@@ -4186,7 +5342,13 @@ static void draw_video(const VideoTexture& texture, ImVec2 pos, ImVec2 size)
             uv1.x = 1.0f - uv0.x;
         }
     }
-    dl->AddImage(texture.im_id(), a, b, uv0, uv1);
+    // The whole picture's size in screen pixels (Fill crops it): what the
+    // enhancement passes upscale to for the next frame.
+    ImVec2 fb = ImGui::GetIO().DisplayFramebufferScale;
+    g_enh.want_w = (int)std::lround((b.x - a.x) / std::max(1e-4f, uv1.x - uv0.x) * fb.x);
+    g_enh.want_h = (int)std::lround((b.y - a.y) / std::max(1e-4f, uv1.y - uv0.y) * fb.y);
+    if (g_enh.shown && g_enh.out_descriptor) dl->AddImage((ImTextureID)(intptr_t)g_enh.out_descriptor, a, b, uv0, uv1);
+    else dl->AddImage(texture.im_id(), a, b, uv0, uv1);
 }
 
 // Glass pill over the picture with a coloured dot; returns its size.
@@ -4216,7 +5378,8 @@ static ImVec2 status_pill(glint::App& app, ImVec2 p, double now)
     std::string name = config.platform.empty() ? "PS5" : config.platform;
     char picture[32] = "";
     if (link == Link::Live && config.height > 0) std::snprintf(picture, sizeof(picture), "%dp%d", config.height, config.fps);
-    const char* state = link == Link::Connecting ? "Connecting" : link == Link::Failed ? "Can't reach the console"
+    const char* state = link == Link::Connecting ? "Connecting"
+                      : link == Link::Failed ? (watched_elsewhere(app) ? "Watching elsewhere" : "Can't reach the console")
                       : link == Link::Offline ? "Not connected" : picture;
     std::vector<float> late = link == Link::Live ? app.recent_lateness(60) : std::vector<float>();
     char hold[24] = "", rate[24] = "";
@@ -4377,13 +5540,18 @@ static void draw_empty_state(glint::App& app, ImVec2 center)
         if (button("##connect_empty", nullptr, "Connect", Kind::Primary, ImVec2(bw, ImGui::GetItemRectSize().y)) || enter)
             connect_to(app);
         if (link == Link::Failed) {
+            bool elsewhere = watched_elsewhere(app);
             ImGui::PushFont(F.small);
-            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(C.danger));
+            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(elsewhere ? C.muted : C.danger));
             if (F.icons) {
-                ImGui::TextUnformatted(icon::warning);
+                ImGui::TextUnformatted(elsewhere ? icon::info : icon::warning);
                 ImGui::SameLine(0, px(8));
             }
-            ImGui::TextWrapped("No answer from %s. Check that the Glint payload is running on the PS5.", g_shell.url);
+            if (elsewhere)
+                ImGui::TextWrapped("Glint is open in a browser or on another PC, and the PS5 streams to one at a "
+                                   "time. Connect to watch here.");
+            else
+                ImGui::TextWrapped("No answer from %s. Check that the Glint payload is running on the PS5.", g_shell.url);
             ImGui::PopStyleColor();
             ImGui::PopFont();
         }
@@ -4559,8 +5727,9 @@ static void draw_ui(glint::App& app, VideoTexture& texture)
         if (ImGui::IsItemHovered()) g_shell.pointer_on_controls = true;
         tip("Gallery  (G)");
 
-        // Bottom: the command bar, only while there is a picture to act on.
-        if (has_video) {
+        // Bottom: the command bar, only while there is a picture to act on
+        // (side by side's control panel takes its place).
+        if (has_video && !(g_compare.on && g_tweaks_open)) {
             bool sound = app.audio().enabled();
             float bh = px(44), gap = px(6), pad = px(6), sep = px(13);
             float bw_sound = px(44), vol_w = px(150);
@@ -4646,6 +5815,7 @@ static void draw_ui(glint::App& app, VideoTexture& texture)
     draw_settings(app);
     draw_gallery(app);
     ImGui::End();
+    draw_picture_tweaks(vp->Pos, vp->Size);
 
     draw_toasts(vp->Pos.y + vp->Size.y - px(110));
 }
@@ -4669,7 +5839,7 @@ static void draw_headless(glint::App& app, int frames)
     static const char* modes[] = {"Lowest", "Balanced", "Smooth"};
     std::printf("latency=%s hold=%.0f ms late=%llu frames\n", modes[(int)app.latency()], app.video_hold_ms(),
                 (unsigned long long)app.late_frames());
-    if (app.frame_count() == 0)
+    if (app.frame_count() == 0 || !app.connected())
         std::fprintf(stderr, "error=%s\n", app.error().c_str());
 }
 
@@ -5216,6 +6386,9 @@ static glint::AppSettings capture_settings(glint::App& app)
     // The user's choice; a CPU fallback forced by a missing GPU path is not saved as one.
     s.gpu_convert = app.gpu_convert() || (g_yuv.tried && !g_yuv.available);
     s.latency = (int)app.latency();
+    s.enhance = g_picture;
+    s.picture_presets = g_picture_presets;
+    s.picture_active = g_picture_active;
     s.window_x = g_shell.normal[0];
     s.window_y = g_shell.normal[1];
     s.window_w = g_shell.normal[2];
@@ -5239,6 +6412,9 @@ static void apply_settings(glint::App& app, const glint::AppSettings& s, bool ke
     app.set_gpu_decode(s.gpu_decode);
     app.set_gpu_convert(s.gpu_convert);
     app.set_latency((glint::App::Latency)std::clamp(s.latency, 0, 2));
+    g_picture = s.enhance;
+    g_picture_presets = s.picture_presets;
+    g_picture_active = s.picture_active;
     g_shell.recent = s.recent;
     ui::set_theme(s.theme, true);
 }
@@ -5584,6 +6760,7 @@ int main(int argc, char** argv)
 
     glint::App app;
     VideoTexture texture;
+    texture.live = true;   // gets the picture enhancement passes
     if (!record_dir.empty()) app.set_media_dir(record_dir);
     apply_settings(app, settings, !record_dir.empty());
     std::snprintf(g_shell.url, sizeof(g_shell.url), "%s", url.c_str());
@@ -5636,8 +6813,12 @@ int main(int argc, char** argv)
             start_view.clear();
         }
 
+        picture_update();
         auto frame = app.take_frame(frame_seen);
-        if (frame && frame->width > 0 && frame->height > 0) present_picture(texture, *frame, app);
+        if (frame && frame->width > 0 && frame->height > 0) {
+            present_picture(texture, *frame, app);
+            enhance_dump_maybe();
+        }
 
         ImGui_ImplVulkan_NewFrame();
         ImGui_ImplGlfw_NewFrame();
@@ -5691,6 +6872,7 @@ int main(int argc, char** argv)
     g_viewer.player.close();
     destroy_texture(g_viewer_tex);
     destroy_thumbs();
+    enhance_destroy();
     yuv_converter_destroy();
 
     if (g_UploadFence) vkDestroyFence(g_Device, g_UploadFence, g_Allocator);

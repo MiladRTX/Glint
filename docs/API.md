@@ -111,7 +111,7 @@ float samples).
 
 ```json
 {
-  "version": "1.0",
+  "version": "1.5",
   "backend": "h264",
   "width": 1920,
   "height": 1080,
@@ -120,6 +120,8 @@ float samples).
   "fps": 60.3,
   "kbps": 1008.8,
   "clients": 1,
+  "viewers": 1,
+  "bitrate": 20000000,
   "recording": false,
   "recording_name": "",
   "recording_frames": 0,
@@ -137,6 +139,8 @@ float samples).
 time since the server last (re)started, so they overcount after an encoder
 reopen. The app shows its own rate over the last 2 s instead.
 `clients` counts every open request socket (including status polling).
+`viewers` is how many people are watching: 1 while the current viewer has a
+stream open, else 0 (see [One viewer at a time](#one-viewer-at-a-time)).
 
 ## Recording
 
@@ -190,3 +194,35 @@ Response body shape: `{"message":"..."}` over `HTTP/1.1 <code> Profile`.
 | Receive timeout | 1 s |
 | Max video frame | 2 MiB |
 | Max audio packet | 64 KiB |
+
+## One viewer at a time
+
+`/frames`, `/audio` and `/rtp/video` belong to one viewer at a time. A viewer
+is named by `?viewer=<id>` (letters, digits, `-`, `_`; the dashboard makes a
+new one per page) or, without it, by the client's IP address (the desktop app).
+
+- A different viewer connecting takes over: every stream of the current viewer
+  ends.
+- A viewer that was pushed out is refused with **HTTP 409** while the one that
+  pushed it is still watching (or reconnecting within 5 s), so two clients that
+  reconnect on their own can't take turns kicking each other.
+- `&take=1` takes over anyway (the dashboard's **Watch here** button).
+- Once the current viewer has been gone for 5 s, anyone can connect again.
+
+## Bitrate
+
+The encoder runs at **20 Mbit/s** (`bitrate` in `status.json`; a `bitrate=N`
+start argument changes it). Measured in a busy game over Wi-Fi, 20 Mbit/s
+hitched about half as often as 30, and 40 and 60 more still; a calm home
+screen needs far less.
+
+It is set once, before `Start`, and can't change while Glint runs (tested on a
+PS5, 13.60):
+
+- `SetVideoBitrate` on a running session returns ok, but every `ReadVideo`
+  after it fails with 0x80c78000 and the encoder stays locked until a restart.
+- Closing the session cleanly (Stop, Close, arbitrator cleared) and opening a
+  new one gets through `OpenVideo` and `SetVideoBitrate`, then `Start` is
+  refused with 0x80c78000. The encoder takes one capture session per boot.
+- Every frame is a reference frame (`nal_ref_idc` 2), so a cap after the
+  encoder can't drop frames without breaking the picture.

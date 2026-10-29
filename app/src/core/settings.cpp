@@ -148,7 +148,8 @@ bool AppSettings::operator==(const AppSettings& o) const {
     return console_url == o.console_url && recent == o.recent && theme == o.theme && sound == o.sound && volume == o.volume && delay_auto == o.delay_auto &&
            delay_ms == o.delay_ms && video_sync == o.video_sync && av_offset_ms == o.av_offset_ms &&
            media_dir == o.media_dir && picture == o.picture && gpu_decode == o.gpu_decode &&
-           gpu_convert == o.gpu_convert && latency == o.latency && window_x == o.window_x &&
+           gpu_convert == o.gpu_convert && latency == o.latency && enhance == o.enhance &&
+           picture_presets == o.picture_presets && picture_active == o.picture_active && window_x == o.window_x &&
            window_y == o.window_y && window_w == o.window_w && window_h == o.window_h &&
            maximized == o.maximized && fullscreen == o.fullscreen;
 }
@@ -197,6 +198,56 @@ void load_settings(AppSettings& s, std::vector<std::string>& warnings) {
             r.text("latency", v);
             if (v == "balanced") s.latency = 1;
             if (v == "smooth") s.latency = 2;
+        }
+    }
+    {
+        std::map<std::string, std::string> kv;
+        if (read_kv(file_in("picture.conf"), "GLINT-PICTURE-1", kv, warnings)) {
+            Reader r{kv, warnings, "picture.conf"};
+            PictureSettings& e = s.enhance;
+            r.integer("profile", e.profile, 0, 4);
+            r.boolean("protect", e.protect);
+            r.real("budget_ms", e.budget_ms, 0.5f, 10.0f);
+            r.integer("upscaler", e.upscaler, 0, 3);
+            r.real("sharpness", e.sharpness, 0.0f, 1.0f);
+            r.real("denoise", e.denoise, 0.0f, 1.0f);
+            r.real("deband", e.deband, 0.0f, 1.0f);
+            r.real("dither", e.dither, 0.0f, 1.0f);
+            r.real("exposure", e.exposure, -2.0f, 2.0f);
+            r.real("saturation", e.saturation, 0.0f, 2.0f);
+            r.real("shadows", e.shadows, 0.0f, 1.0f);
+            r.text("active", s.picture_active);
+            // presetN=name|upscaler|sharpness|denoise|deband|dither|exposure|saturation|shadows
+            for (int i = 1; i <= kMaxPicturePresets; i++) {
+                std::string line;
+                r.text(("preset" + std::to_string(i)).c_str(), line);
+                if (line.empty()) continue;
+                std::vector<std::string> f;
+                std::stringstream ss(line);
+                for (std::string part; std::getline(ss, part, '|');) f.push_back(part);
+                PicturePreset p;
+                if (f.size() != 9 || f[0].empty()) {
+                    warnings.push_back("picture.conf: preset" + std::to_string(i) + " is not readable");
+                    continue;
+                }
+                p.name = f[0];
+                PictureSettings& v = p.values;
+                auto num = [&](const std::string& t, float lo, float hi, float fallback) {
+                    char* end = nullptr;
+                    double n = std::strtod(t.c_str(), &end);
+                    return (end && *end == 0 && std::isfinite(n) && n >= lo && n <= hi) ? (float)n : fallback;
+                };
+                v.upscaler = (int)num(f[1], 0, 3, (float)v.upscaler);
+                v.sharpness = num(f[2], 0, 1, v.sharpness);
+                v.denoise = num(f[3], 0, 1, v.denoise);
+                v.deband = num(f[4], 0, 1, v.deband);
+                v.dither = num(f[5], 0, 1, v.dither);
+                v.exposure = num(f[6], -2, 2, v.exposure);
+                v.saturation = num(f[7], 0, 2, v.saturation);
+                v.shadows = num(f[8], 0, 1, v.shadows);
+                v.profile = 4;   // Custom
+                s.picture_presets.push_back(p);
+            }
         }
     }
     {
@@ -263,6 +314,26 @@ bool save_settings(const AppSettings& s, std::string& error) {
       << (s.gpu_convert ? "gpu" : "cpu") << "\nlatency="
       << (s.latency == 2 ? "smooth" : s.latency == 1 ? "balanced" : "lowest") << "\n";
     if (!write_file_atomic(path("video.conf"), v.str(), error)) return false;
+    const PictureSettings& pe = s.enhance;
+    std::ostringstream q;
+    q << "GLINT-PICTURE-1\nprofile=" << pe.profile << "\nprotect=" << (pe.protect ? 1 : 0)
+      << "\nbudget_ms=" << f(pe.budget_ms) << "\nupscaler=" << pe.upscaler << "\nsharpness=" << f(pe.sharpness)
+      << "\ndenoise=" << f(pe.denoise) << "\ndeband=" << f(pe.deband) << "\ndither=" << f(pe.dither)
+      << "\nexposure=" << f(pe.exposure) << "\nsaturation=" << f(pe.saturation) << "\nshadows=" << f(pe.shadows)
+      << "\n";
+    if (!s.picture_active.empty()) q << "active=" << s.picture_active << "\n";
+    int n = 0;
+    for (const PicturePreset& p : s.picture_presets) {
+        if (++n > kMaxPicturePresets) break;
+        std::string name;
+        for (char ch : p.name)   // the separator and line breaks can't be in a name
+            if (ch != '|' && ch != '\n' && ch != '\r') name += ch;
+        const PictureSettings& v = p.values;
+        q << "preset" << n << "=" << name << "|" << v.upscaler << "|" << f(v.sharpness) << "|" << f(v.denoise) << "|"
+          << f(v.deband) << "|" << f(v.dither) << "|" << f(v.exposure) << "|" << f(v.saturation) << "|"
+          << f(v.shadows) << "\n";
+    }
+    if (!write_file_atomic(path("picture.conf"), q.str(), error)) return false;
     std::ostringstream c;
     c << "GLINT-CAPTURE-1\nmedia_dir=" << s.media_dir << "\n";
     if (!write_file_atomic(path("capture.conf"), c.str(), error)) return false;
@@ -277,7 +348,8 @@ bool save_settings(const AppSettings& s, std::string& error) {
 
 std::vector<std::string> shareable_settings_files() {
     // Never oauth-apps.conf or anything from the vault.
-    return {"console.conf", "audio.conf", "video.conf", "capture.conf", "window.conf", "destinations.conf"};
+    return {"console.conf", "audio.conf", "video.conf", "picture.conf", "capture.conf", "window.conf",
+            "destinations.conf"};
 }
 
 } // namespace glint

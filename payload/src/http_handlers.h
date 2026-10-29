@@ -5,11 +5,11 @@
  * and sends the complete HTTP response. */
 void sl_http_configuration(int fd);
 void sl_http_status(int fd);
-void sl_http_stream(int fd);
-void sl_http_audio(int fd);
+void sl_http_stream(int fd, uint64_t epoch);
+void sl_http_audio(int fd, uint64_t epoch);
 void sl_http_recordings(int fd);
 void sl_http_download(int fd, const char *name);
-void sl_http_rtp(int fd, int port);
+void sl_http_rtp(int fd, int port, uint64_t epoch);
 void sl_http_select_profile(int fd, const char *path);
 
 /* Shared helpers (server.c). */

@@ -15,7 +15,7 @@
  * buffers below and the server pumps them out.
  */
 
-#define SL_VERSION        "1.0"   /* shown in the console banner, capture.log and /status.json */
+#define SL_VERSION        "1.5"   /* shown in the console banner, capture.log and /status.json */
 #define SL_MAX_CLIENTS    16
 #define SL_MAX_STREAMING   8
 #define SL_VIDEO_SLOTS    64
@@ -65,6 +65,15 @@ typedef struct sl_state {
     int      listen_fd;
     int      client_count;
     int      streaming_count;
+
+    /* One viewer at a time (server.c, sl_viewer_admit). A new viewer takes
+     * over and every stream of the previous one ends; viewers it pushed out
+     * are refused while it still watches, so two of them can't fight. */
+    char     viewer[48];
+    uint64_t viewer_epoch;
+    int      viewer_streams;
+    uint64_t viewer_idle_ms;
+    char     viewer_kicked[4][48];
     volatile int keyframe_request;
     volatile int record_requested;
 
@@ -142,6 +151,7 @@ void sl_profile_failed(void);
 /* ---- backend ---- */
 int  sl_capture_start(void);
 void sl_capture_stop(void);
+int  sl_capture_failed(void);   /* the encoder refused for good: quit instead of waiting */
 
 /* ---- helpers ---- */
 uint64_t sl_now_ms(void);

@@ -1,0 +1,17 @@
+#version 450
+// AI upscaler, input: the picture's luma for the FSRCNNX network (fsrcnnx/),
+// which works on brightness only.
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 0, rgba16f) uniform writeonly image2D dst;
+layout(binding = 1) uniform sampler2D src;      // the cleaned-up picture, stream size
+
+layout(push_constant) uniform Params { ivec2 size; } p;
+
+void main()
+{
+    ivec2 at = ivec2(gl_GlobalInvocationID.xy);
+    if (at.x >= p.size.x || at.y >= p.size.y) return;
+    vec3 c = texelFetch(src, at, 0).rgb;
+    imageStore(dst, at, vec4(dot(c, vec3(0.2126, 0.7152, 0.0722)), 0.0, 0.0, 1.0));
+}

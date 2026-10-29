@@ -1,6 +1,60 @@
 # Changelog
 
 
+## [1.5] - 2026-10-29
+
+Upload the payload as `/data/pldmgr/payloads/local/glint/Glint-1.5-ps5.elf`.
+
+### Desktop app (Windows)
+
+- **Picture enhancement**, a new Settings tab: GPU passes between the stream
+  and the screen. Profiles Off, Light, Balanced (FSR 1), Enhanced (AI) and
+  Custom; upscaling with Bilinear, Lanczos, AMD FidelityFX FSR 1 or FSRCNNX
+  (a small neural network, from 1.3x); contrast-adaptive sharpening;
+  edge-preserving denoise, debanding and dithering; exposure, saturation and
+  shadow detail. Measured on an RX 9070 at 4K output: 0.14 ms (Bilinear) to
+  1.23 ms (AI) per frame. "Protect frame time" steps the profile down when
+  the passes go over a GPU budget. Off costs nothing.
+- **My presets:** save the current values under a name, apply, update,
+  revert and delete. The applied preset is marked (Applied, or Changed after
+  an edit) and stays applied across restarts. All in `picture.conf`.
+- **Side-by-side compare** (C, or Settings → Picture): the original and the
+  enhanced picture next to each other; scroll zooms (up to 8x) around the
+  pointer, drag pans both, double-click resets. X opens a tweak panel over the
+  picture without dimming it.
+- **One viewer at a time:** connecting takes the stream from a browser or
+  another PC; when one takes it from the app, the app says "Watching
+  elsewhere" instead of an error.
+- **Sound delay** about 190 → 100 ms: the automatic buffer still grows on a
+  choppy network, but starts lower (Lowest 40, Balanced 60, Smooth 120 ms).
+- Gallery: follows the folder (files deleted or added in Explorer show up),
+  screenshots show their size instead of 0x0, Fit/100% is a proper switch,
+  and a zoomed screenshot pans with press-and-drag.
+- Fixed: a crash when zooming fast (a recreated image could reuse a freed
+  handle), and a crash opening the gallery (the UI's texture pool held 8).
+
+### Payload (PS5)
+
+- **20 Mbit/s** encoder bitrate (was 60): in a busy game over Wi-Fi it
+  hitched about half as often as 30. The bitrate can only be set when
+  capture starts (docs/API.md, Bitrate).
+- **One viewer at a time:** the newest viewer gets the stream; one that was
+  pushed out is refused (409) while the new one watches, so two can't fight.
+  `status.json` gains `viewers` and `bitrate`.
+- Process name **Glint.elf** (listed with the other payloads in Payload
+  Manager). The previous run's log is kept as `capture.prev.log`; a refused
+  start quits at once and says "Load Glint again".
+
+### Browser dashboard
+
+- Fixed: the picture froze after ~8 s (the buffer was trimmed past the only
+  keyframe).
+- Lower latency: about 94 → 35 ms from arrival to screen, a jitter buffer for
+  sound, and no video download while the tab is hidden.
+- Sound is on by default (after the browser's required first click).
+- One viewer at a time, with "Watch here" to take the stream back.
+
+
 ## [1.0] - 2026-10-28
 
 Screenlink is now **Glint**: `Glint.exe`, `glint-payload.elf` (upload it as

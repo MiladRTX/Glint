@@ -24,6 +24,7 @@ extern "C" {
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <fstream>
 
 namespace fs = std::filesystem;
 
@@ -202,6 +203,33 @@ bool save_screenshot(const std::string& dir, const std::vector<uint8_t>& frame, 
     return ok;
 }
 
+FolderWatch::~FolderWatch() { close(); }
+
+void FolderWatch::close() {
+    if (handle_ && handle_ != INVALID_HANDLE_VALUE) FindCloseChangeNotification((HANDLE)handle_);
+    handle_ = nullptr;
+}
+
+void FolderWatch::watch(const std::string& dir) {
+    if (dir == dir_ && handle_ && handle_ != INVALID_HANDLE_VALUE) return;
+    close();
+    dir_ = dir;
+    // A folder that doesn't exist yet can't be watched; watch() is called
+    // again on the next refresh and picks it up once it does.
+    std::wstring wide = fs::u8path(dir).wstring();
+    HANDLE h = FindFirstChangeNotificationW(wide.c_str(), FALSE,
+                                            FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_SIZE |
+                                                FILE_NOTIFY_CHANGE_LAST_WRITE);
+    handle_ = h == INVALID_HANDLE_VALUE ? nullptr : (void*)h;
+}
+
+bool FolderWatch::changed() {
+    if (!handle_) return false;
+    if (WaitForSingleObject((HANDLE)handle_, 0) != WAIT_OBJECT_0) return false;
+    if (!FindNextChangeNotification((HANDLE)handle_)) close();   // the folder went away: watch again later
+    return true;
+}
+
 std::vector<GalleryItem> list_gallery(const std::string& dir) {
     std::vector<GalleryItem> items;
     std::error_code ec;
@@ -239,6 +267,17 @@ std::vector<GalleryItem> list_gallery(const std::string& dir) {
                     }
                 }
                 avformat_close_input(&fmt);
+            }
+        } else {
+            // A PNG's size is in its header: the IHDR chunk right after the
+            // 8-byte signature holds width and height (big-endian) at 16..23.
+            std::ifstream png(entry.path(), std::ios::binary);
+            unsigned char head[24] = {};
+            if (png.read(reinterpret_cast<char*>(head), sizeof(head)) && head[1] == 'P' && head[2] == 'N' &&
+                head[3] == 'G' && std::memcmp(head + 12, "IHDR", 4) == 0) {
+                auto be32 = [&](int at) { return (int)((head[at] << 24) | (head[at + 1] << 16) | (head[at + 2] << 8) | head[at + 3]); };
+                item.width = be32(16);
+                item.height = be32(20);
             }
         }
         items.push_back(std::move(item));

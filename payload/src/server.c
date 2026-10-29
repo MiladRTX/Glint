@@ -1,8 +1,10 @@
 #include "glint.h"
 #include "http_handlers.h"
 
+#include <ctype.h>
 #include <errno.h>
 #include <signal.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -126,12 +128,97 @@ static int parse_rtp_port(const char *path, int *port)
     return 1;
 }
 
+/* The viewer a stream request belongs to: "?viewer=<id>" (the dashboard sends
+ * one per page), or "ip:<address>" for clients that don't (the desktop app).
+ * "take=1" asks to take over from a viewer that pushed this one out. */
+static void viewer_of(int fd, const char *path, char *out, size_t cap, int *take)
+{
+    const char *query = strchr(path, '?');
+    out[0] = 0;
+    *take = 0;
+    if (query) {
+        const char *v = strstr(query, "viewer=");
+        if (v) {
+            v += 7;
+            size_t n = 0;
+            while (n + 1 < cap && (isalnum((unsigned char)v[n]) || v[n] == '-' || v[n] == '_')) {
+                out[n] = v[n];
+                n++;
+            }
+            out[n] = 0;
+        }
+        *take = strstr(query, "take=1") != NULL;
+    }
+    if (out[0]) return;
+
+    struct sockaddr_in peer;
+#ifdef _WIN32
+    int len = sizeof(peer);
+    int ok = getpeername((SOCKET)fd, (struct sockaddr *)&peer, &len) == 0;
+#else
+    socklen_t len = sizeof(peer);
+    int ok = getpeername(fd, (struct sockaddr *)&peer, &len) == 0;
+#endif
+    const uint8_t *a = (const uint8_t *)&peer.sin_addr;
+    if (ok) snprintf(out, cap, "ip:%u.%u.%u.%u", a[0], a[1], a[2], a[3]);
+    else snprintf(out, cap, "ip:unknown");
+}
+
+static int viewer_was_kicked(const char *id)
+{
+    for (int i = 0; i < 4; i++)
+        if (strcmp(g.viewer_kicked[i], id) == 0) return 1;
+    return 0;
+}
+
+/* Called with g.lock held for every stream request. One viewer at a time: the
+ * current one always gets in, anyone else takes over and every stream of the
+ * current one ends. A viewer that was pushed out is refused while the one that
+ * pushed it is still watching (or reconnecting, SL_VIEWER_GRACE_MS), unless it
+ * asks with take=1, so two viewers that reconnect on their own can't fight. */
+#define SL_VIEWER_GRACE_MS 5000
+
+/* With g.lock held: the current viewer has a stream open, or had one moments ago. */
+static int viewer_watching(void)
+{
+    return g.viewer[0] &&
+        (g.viewer_streams > 0 || sl_now_ms() - g.viewer_idle_ms < SL_VIEWER_GRACE_MS);
+}
+
+static int viewer_admit(const char *id, int take, uint64_t *epoch)
+{
+    if (strcmp(id, g.viewer) != 0) {
+        int watching = viewer_watching();
+        if (!watching) memset(g.viewer_kicked, 0, sizeof(g.viewer_kicked));
+        else if (viewer_was_kicked(id) && !take) return 0;
+
+        for (int i = 0; i < 4; i++)
+            if (strcmp(g.viewer_kicked[i], id) == 0) g.viewer_kicked[i][0] = 0;
+        if (g.viewer_streams > 0) {   /* pushed out while watching (not one that had just left) */
+            memmove(g.viewer_kicked[1], g.viewer_kicked[0], sizeof(g.viewer_kicked[0]) * 3);
+            snprintf(g.viewer_kicked[0], sizeof(g.viewer_kicked[0]), "%s", g.viewer);
+        }
+        snprintf(g.viewer, sizeof(g.viewer), "%s", id);
+        g.viewer_epoch++;
+        g.viewer_streams = 0;
+        pthread_cond_broadcast(&g.cond);   /* wake the old viewer's streams so they end */
+    }
+    g.viewer_streams++;
+    *epoch = g.viewer_epoch;
+    return 1;
+}
+
+static void viewer_leave(uint64_t epoch)
+{
+    if (epoch == g.viewer_epoch && --g.viewer_streams == 0) g.viewer_idle_ms = sl_now_ms();
+}
+
 static int streaming_route(const char *path, int rtp_port)
 {
     return path_is(path, "/frames") || path_is(path, "/audio") || rtp_port != 0;
 }
 
-static void dispatch(int fd, const char *method, const char *path, int rtp_port)
+static void dispatch(int fd, const char *method, const char *path, int rtp_port, uint64_t epoch)
 {
     if (path_is(method, "GET")) {
         if (path_is(path, "/")) {
@@ -144,9 +231,9 @@ static void dispatch(int fd, const char *method, const char *path, int rtp_port)
         }
         if (path_is(path, "/config.json")) { sl_http_configuration(fd); return; }
         if (path_is(path, "/status.json"))  { sl_http_status(fd); return; }
-        if (path_is(path, "/frames"))       { sl_http_stream(fd); return; }
-        if (path_is(path, "/audio"))        { sl_http_audio(fd); return; }
-        if (rtp_port)                       { sl_http_rtp(fd, rtp_port); return; }
+        if (path_is(path, "/frames"))       { sl_http_stream(fd, epoch); return; }
+        if (path_is(path, "/audio"))        { sl_http_audio(fd, epoch); return; }
+        if (rtp_port)                       { sl_http_rtp(fd, rtp_port, epoch); return; }
         if (path_is(path, "/recordings"))   { sl_http_recordings(fd); return; }
         if (path_starts(path, "/recordings/")) {
             sl_http_download(fd, path + strlen("/recordings/"));
@@ -234,6 +321,7 @@ static void *client_thread(void *arg)
     request[0] = 0;   /* a peer that closes before sending anything leaves it empty */
     size_t used = 0;
     int streaming = 0;
+    uint64_t epoch = 0;
     uint64_t deadline = sl_now_ms() + 5000;
 
     for (;;) {
@@ -268,11 +356,25 @@ static void *client_thread(void *arg)
     int rtp_port = 0;
     parse_rtp_port(path, &rtp_port);
 
+    /* The route without its query ("/frames?viewer=..." -> "/frames"). */
+    char route[256];
+    snprintf(route, sizeof(route), "%s", path);
+    char *query = strchr(route, '?');
+    if (query && !rtp_port) *query = 0;
+
     pthread_mutex_lock(&g.lock);
-    if (streaming_route(path, rtp_port)) {
+    if (streaming_route(route, rtp_port)) {
         if (g.streaming_count >= SL_MAX_STREAMING) {
             pthread_mutex_unlock(&g.lock);
             reply_busy(fd);
+            goto done;
+        }
+        char viewer[48];
+        int take = 0;
+        viewer_of(fd, path, viewer, sizeof(viewer), &take);
+        if (!viewer_admit(viewer, take, &epoch)) {
+            pthread_mutex_unlock(&g.lock);
+            sl_profile_reply(fd, 409, "Someone else is watching");
             goto done;
         }
         g.streaming_count++;
@@ -280,7 +382,7 @@ static void *client_thread(void *arg)
     }
     pthread_mutex_unlock(&g.lock);
 
-    dispatch(fd, method, path, rtp_port);
+    dispatch(fd, method, streaming ? route : path, rtp_port, epoch);
 
 done:
     pthread_mutex_lock(&g.lock);
@@ -291,7 +393,10 @@ done:
 #endif
     g.slot_fd[slot] = -1;
     g.client_count--;
-    if (streaming) g.streaming_count--;
+    if (streaming) {
+        g.streaming_count--;
+        viewer_leave(epoch);
+    }
     g.slot_used[slot] = 0;
     pthread_mutex_unlock(&g.lock);
     return NULL;

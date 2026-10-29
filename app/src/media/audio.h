@@ -93,7 +93,7 @@ public:
     void set_delay_auto(bool on);
     bool delay_auto() const;
     int effective_delay_ms() const;     // the target in use right now
-    // Smallest automatic buffer (Latency: Lowest 100 ms, Smooth 150 ms).
+    // Smallest automatic buffer (Latency: Lowest 40 ms, Balanced 60 ms, Smooth 120 ms).
     void set_auto_floor_ms(int ms);
     // Time from a packet arriving to it reaching the speaker. -1 while not
     // playing (stopped, buffering, sound off). Used to hold video in sync.
