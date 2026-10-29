@@ -10,10 +10,10 @@ sl_options sl_opts = {
     .port = 7231,
     .height = 1080,
     .fps = 60,
-    /* Measured in a busy game over Wi-Fi: 20 Mbit/s hitched about half as
-     * often as 30 (40 and 60 more still). Set once at start: the encoder
-     * can't change it on a running session. */
-    .bitrate = 20000000u,
+    /* About 35-38 Mbit/s in a busy game: clearly sharper than 20-30 (20 is
+     * blocky in fast motion), as smooth as 20 on a clean Wi-Fi stretch. Set
+     * once at start: the encoder can't change it on a running session. */
+    .bitrate = 50000000u,
     .minqp = 18,
     .audio = 1,
 };

@@ -35,9 +35,9 @@ Upload the payload as `/data/pldmgr/payloads/local/glint/Glint-1.5-ps5.elf`.
 
 ### Payload (PS5)
 
-- **20 Mbit/s** encoder bitrate (was 60): in a busy game over Wi-Fi it
-  hitched about half as often as 30. The bitrate can only be set when
-  capture starts (docs/API.md, Bitrate).
+- **50 Mbit/s** encoder bitrate (was 60; about 35-38 Mbit/s in a busy game):
+  sharp in fast motion, and as smooth as lower rates on a clean Wi-Fi. The
+  bitrate can only be set when capture starts (docs/API.md, Bitrate).
 - **One viewer at a time:** the newest viewer gets the stream; one that was
   pushed out is refused (409) while the new one watches, so two can't fight.
   `status.json` gains `viewers` and `bitrate`.

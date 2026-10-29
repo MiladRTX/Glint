@@ -121,7 +121,7 @@ float samples).
   "kbps": 1008.8,
   "clients": 1,
   "viewers": 1,
-  "bitrate": 20000000,
+  "bitrate": 50000000,
   "recording": false,
   "recording_name": "",
   "recording_frames": 0,
@@ -211,10 +211,11 @@ new one per page) or, without it, by the client's IP address (the desktop app).
 
 ## Bitrate
 
-The encoder runs at **20 Mbit/s** (`bitrate` in `status.json`; a `bitrate=N`
-start argument changes it). Measured in a busy game over Wi-Fi, 20 Mbit/s
-hitched about half as often as 30, and 40 and 60 more still; a calm home
-screen needs far less.
+The encoder runs at **50 Mbit/s** (`bitrate` in `status.json`; a `bitrate=N`
+start argument changes it). In a busy game that comes out at about 35-38
+Mbit/s; a calm home screen needs far less. Measured over Wi-Fi (about 40 s
+of GTA each): 20 Mbit/s looked blocky in fast motion; 50 was as smooth as 20
+on a clean stretch, and hitched more only when the Wi-Fi itself was choppy.
 
 It is set once, before `Start`, and can't change while Glint runs (tested on a
 PS5, 13.60):
