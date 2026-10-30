@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.2.1] - 2026-10-30
+
+Upload the payload as `/data/pldmgr/payloads/local/glint/Glint-1.2.1-ps5.elf`.
+
+### Payload (PS5)
+
+- Fixed: on some TVs, Glint said "the PS5 switched to 120 Hz output" at
+  60 Hz and didn't start. The 120 Hz check assumed one TV's video-out mode
+  value (0x10); it now says 120 Hz only for the 120 Hz value (0x40) or when
+  the mode changes while Glint runs. Those consoles now also get the
+  automatic retry on the first start after a restart.
+
 ## [1.2] - 2026-10-29
 
 Upload the payload as `/data/pldmgr/payloads/local/glint/Glint-1.2-ps5.elf`.

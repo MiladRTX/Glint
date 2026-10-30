@@ -287,14 +287,24 @@ static int g_run_count;             /* completed runs; a run after the first is 
 static int g_restart_pending;       /* restart taken by the live loop, serviced by the next run */
 static int g_need_terminate;        /* SetCallback reported a stale session (0x819b0007) */
 static volatile int g_encoder_locked; /* set once; no retries after this, reboot required */
-/* GetVideoOutMode's answer: 0x10 at the usual 60 Hz output. A game that
+/* GetVideoOutMode's answer depends on the TV and its settings (0x10 on one
+ * 1080p60 setup; other consoles report other values at 60 Hz). A game that
  * switches the console to 120 Hz output (Settings > Screen and Video >
  * 120 Hz Output on Auto/On) changes it (0x0 while switching, 0x40 after),
- * and the encoder then refuses to reopen. */
-#define SL_VIDEO_MODE_USUAL 0x10u
-static uint32_t g_last_video_mode = SL_VIDEO_MODE_USUAL;
+ * and the encoder then refuses to reopen. So 120 Hz is 0x40, or a mode that
+ * differs from the one the first run saw. */
+#define SL_VIDEO_MODE_120HZ 0x40u
+static uint32_t g_last_video_mode;
+static uint32_t g_first_video_mode;
+static int g_have_first_video_mode;
 #define SL_START_RETRIES 3
 static int g_start_retries;         /* Start refusals before the first frame (see capture_session) */
+
+static int video_mode_is_120hz(void)
+{
+    return g_last_video_mode == SL_VIDEO_MODE_120HZ ||
+           (g_have_first_video_mode && g_last_video_mode != g_first_video_mode);
+}
 
 static void encoder_locked(const char *where)
 {
@@ -304,7 +314,7 @@ static void encoder_locked(const char *where)
      * restart, so we don't claim it will. */
     cap_log("encoder refused to start (%s, video-out mode 0x%x)\n", where, g_last_video_mode);
     if (!first) return;
-    if (g_last_video_mode != SL_VIDEO_MODE_USUAL)
+    if (video_mode_is_120hz())
         sl_notify(1, "Glint: the PS5 switched to 120 Hz output, which Glint can't capture. Set Screen "
                      "and Video > Video Output > 120 Hz Output to Off, then restart the PS5.");
     else
@@ -433,6 +443,10 @@ static void capture_session(void)
     cap_log("remote GetVideoOutMode rc=0x%llx mode=0x%x stage=%s\n",
             (unsigned long long)rc, video_mode, ctx.stage);
     g_last_video_mode = video_mode;
+    if (!g_have_first_video_mode) {
+        g_first_video_mode = video_mode;
+        g_have_first_video_mode = 1;
+    }
 
     /* 1080p.
      * Each attempt: Initialize, SetCallback(id), ChangeState(id, RUNNING),
@@ -627,8 +641,7 @@ attempt_failed:
          * steps work a moment later (loading Glint a second time always
          * did). So the first runs get another go; only after that is it
          * the lock only a reboot clears. No remote Close (it may hang). */
-        if (g_run_count == 0 && g_start_retries < SL_START_RETRIES &&
-            g_last_video_mode == SL_VIDEO_MODE_USUAL) {
+        if (g_run_count == 0 && g_start_retries < SL_START_RETRIES && !video_mode_is_120hz()) {
             g_start_retries++;
             cap_log("Start refused before the first frame; trying again (%d of %d)\n",
                     g_start_retries, SL_START_RETRIES);
