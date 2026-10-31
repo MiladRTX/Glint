@@ -32,6 +32,13 @@ Upload the payload as `/data/pldmgr/payloads/local/glint/Glint-1.3-ps5.elf`.
 - Clearer wording in Settings, for example **Picture fit** and **Game audio**.
 - Live streaming, already switched off since 1.0, is removed.
 
+### Browser dashboard
+
+- **Smoother on macOS:** the page no longer copies SPS, PPS and AUD into the
+  video samples (they belong in the init segment). Safari and Chrome on a Mac
+  decode with VideoToolbox, which froze and fell behind on the in-band
+  copies.
+
 ## [1.2.1] - 2026-10-30
 
 Upload the payload as `/data/pldmgr/payloads/local/glint/Glint-1.2.1-ps5.elf`.

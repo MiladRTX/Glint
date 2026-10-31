@@ -346,10 +346,14 @@ function mediaSegment(avcc,key,dts,dur,seq){
   return cat([moof,box('mdat',avcc)]);
 }
 
+// SPS, PPS and AUD (7, 8, 9) stay out of the samples: with an avc1 sample entry
+// the parameter sets belong in avcC (initSegment), and macOS's VideoToolbox
+// stalls on in-band copies (freezes and delay in every macOS browser).
 function toAvcc(au){                                 // Annex-B AU -> length-prefixed NALs
   const nals=[]; let i=0,s=-1;
-  while(i+3<=au.length){ if(au[i]===0&&au[i+1]===0&&au[i+2]===1){ if(s>=0){ let e=i; if(au[e-1]===0) e--; nals.push(au.subarray(s,e)); } s=i+3; i+=3; } else i++; }
-  if(s>=0) nals.push(au.subarray(s,au.length));
+  const keep=n=>{ const t=n.length?n[0]&0x1f:0; if(t<7||t>9) nals.push(n); };
+  while(i+3<=au.length){ if(au[i]===0&&au[i+1]===0&&au[i+2]===1){ if(s>=0){ let e=i; if(au[e-1]===0) e--; keep(au.subarray(s,e)); } s=i+3; i+=3; } else i++; }
+  if(s>=0) keep(au.subarray(s,au.length));
   let tot=0; for(const n of nals) tot+=4+n.length;
   const o=new Uint8Array(tot); let p=0, idr=false, vcl=false;
   for(const n of nals){ const t=n[0]&0x1f; if(t>=1&&t<=5) vcl=true; if(t===5) idr=true;
