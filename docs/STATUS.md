@@ -34,25 +34,20 @@ minute between sessions before it will start again.
 - **Local recording** to MKV (H.264 stream-copy + AAC), **screenshots** (PNG),
   and a **gallery** (grid with thumbnails: play, export MP4/MKV, delete).
   Default folder `%USERPROFILE%\Videos\Glint`.
-- **Live streaming**: switched off in the client (`SL_LIVE_STREAMING`, code kept).
-  When built in: up to 5 RTMP/RTMPS destinations (Twitch, YouTube, TikTok,
-  custom), re-encoded on the GPU when possible (AMF / Media Foundation / x264),
-  keyframe every 2 s. RTMPS goes through Windows TLS with certificate checks.
-  Keys and tokens are held in Windows Credential Manager, never in files or logs.
-  Optional Twitch/YouTube sign-in with your own OAuth client fetches the key.
 - **Settings** in `%LOCALAPPDATA%\Glint` (`console.conf`, `audio.conf`,
-  `video.conf`, `capture.conf`, `window.conf`, `destinations.conf`,
-  `oauth-apps.conf`). Rolling `glint.log` and a diagnostics zip (no secrets).
+  `video.conf`, `picture.conf`, `capture.conf`, `window.conf`). Rolling
+  `glint.log` with a `stats:` line every 10 s while connected (lateness,
+  decode time, sound buffer, frame sizes, encoder QP), and a diagnostics zip
+  (no secrets).
 - **Built-in viewer** for the gallery: recordings play with sound, seek and
   volume; screenshots zoom and pan. `--view <file>` opens one directly.
 - **One file, no console window**: static exe built as a Windows app; version
-  1.2.1 (app and payload).
+  1.3 (app and payload).
 - **Video page**: GPU/CPU decode, GPU/CPU colour conversion, Latency, graphics
   info. The top chip shows the fps and Mbit/s actually received over the last 2 s.
 
 Verified by hand: live view, audio, recording, screenshots, gallery, settings
-persistence, the Video page switches. Streaming built and tested to a private
-destination.
+persistence, the Video page switches.
 
 ## Browser dashboard
 

@@ -1,722 +1,666 @@
 #include "audio.h"
+#include "log.h"
+#include "winutil.h"
+
+#include <tlhelp32.h>
 
 #define SDL_MAIN_HANDLED
 #include <SDL.h>
 
 #include <algorithm>
 #include <atomic>
-#include <chrono>
 #include <cmath>
-#include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <thread>
 #include <vector>
 
-#ifdef _WIN32
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#include <tlhelp32.h>
-#endif
-
 namespace glint {
-namespace {
 
-constexpr int kCallbackSamples = 1024;
-constexpr double kRingSeconds = 3.0;
-constexpr int kMaxDelayMs = 400;
-constexpr float kMaxVolume = 4.0f;
-// Smallest usable prebuffer: one callback (1024) + one payload packet (1024)
-// of arrival granularity + margin. A 0 ms delay setting plays at this floor.
-constexpr int kMinPrimeFrames = 2 * kCallbackSamples + 256;
-constexpr double kDeadbandFrames = 480.0;     // 10 ms @ 48 kHz
-constexpr double kMaxRatioDeviation = 0.03;   // +-3 % drift/latency slew
-constexpr double kWarmupSeconds = 5.0;
-// Auto delay: cover the worst recent arrival lateness (how far packets ran
-// behind the media clock, which is what drains the ring; a run of slightly
-// late packets counts, not just one long gap) plus one callback and one packet
-// of granularity. The memory halves every 60 s. Margin and floors were 50 and
-// 100-150 ms; on Wi-Fi with gaps up to ~60 ms that sat ~190 ms behind the
-// picture for no measured gain (no underruns at the lower values).
-constexpr double kAutoMarginMs = 25.0;
-constexpr double kAutoMinMsDefault = 60.0;
-constexpr double kAutoHalfLifeS = 60.0;
-constexpr double kAutoInitialGapMs = 70.0;
-
-enum class Sample { F32, S16, S32 };
-
-struct SpinLock {
-    std::atomic_flag flag = ATOMIC_FLAG_INIT;
-    void lock() { while (flag.test_and_set(std::memory_order_acquire)) {} }
-    void unlock() { flag.clear(std::memory_order_release); }
-};
-struct SpinGuard {
-    SpinLock& l;
-    explicit SpinGuard(SpinLock& lock) : l(lock) { l.lock(); }
-    ~SpinGuard() { l.unlock(); }
-};
-
-inline void relaxed_max(std::atomic<float>& a, float v) {
-    float cur = a.load(std::memory_order_relaxed);
-    while (v > cur && !a.compare_exchange_weak(cur, v, std::memory_order_relaxed)) {}
-}
-
-} // namespace
-
-struct AudioPlayer::Impl {
-    // Settings (persist across sessions) -------------------------------------
-    std::atomic<bool> enabled{true};
-    std::atomic<float> volume{1.0f};
-    // 250 ms rides out the payload/Wi-Fi stalls seen on hardware in audio soaks (--audio-soak).
-    std::atomic<int> delay_ms{250};
-    std::atomic<bool> delay_auto{true};
-    std::atomic<int> auto_floor_ms{(int)kAutoMinMsDefault};
-    std::atomic<float> auto_target_ms{(float)(kAutoInitialGapMs + kAutoMarginMs)};
-    std::atomic<bool> auto_boost{false};   // set by the callback on underrun
-    // Network thread only:
-    double gap_peak_ms = kAutoInitialGapMs;   // decayed peak of lateness excess
-    bool jitter_init = false;
-    std::chrono::steady_clock::time_point jitter_settle_until{};
-    std::chrono::steady_clock::time_point jitter_t0{};
-    uint64_t jitter_frames0 = 0;
-    double jitter_baseline_ms = 0.0;
-    std::atomic<double> level_pub{-1.0};    // smoothed ring level (frames), -1 unprimed
-
-    // Lifecycle --------------------------------------------------------------
-    std::mutex life;
-    std::thread thread;
-    std::atomic_bool stop_flag{false};
-    SDL_AudioDeviceID device = 0;
-    bool sdl_inited = false;
-    std::string base_url;
-
-    // Session format ---------------------------------------------------------
-    Sample sample_type = Sample::F32;
-    int in_channels = 2;
-    int rate = 48000;
-    std::string format_text;   // guarded by text_mutex
-    std::string device_name;   // guarded by text_mutex
-    std::atomic<int> rate_pub{0};
-    std::atomic<bool> device_pub{false};
-    std::atomic<bool> running{false};
-
-    // Ring buffer (stereo float frames) --------------------------------------
-    mutable SpinLock ring_lock;
-    std::vector<float> ring;      // cap * 2
-    uint64_t cap = 0;
-    uint64_t write_pos = 0;       // absolute frame counters
-    uint64_t read_pos = 0;
-    // callback-owned state (touched under ring_lock or only by callback)
-    bool primed = false;
-    bool first_prime_seen = false;
-    double frac = 0.0;
-    double level_avg = 0.0;
-    double ratio = 1.0;
-    float gain_prev = 1.0f;
-    double warm_frames = 0.0;
-    std::vector<float> scratch;   // preallocated in start()
-
-    // Stats ------------------------------------------------------------------
-    std::atomic<uint64_t> packets{0}, frames_in{0}, frames_out{0}, callbacks{0};
-    std::atomic<uint64_t> drop_events{0}, dropped_frames{0};
-    std::atomic<uint64_t> underruns{0}, underrun_frames{0}, underruns_at_warm{0};
-    std::atomic<uint64_t> nonfinite_in{0}, nonfinite_out{0}, clipped{0}, reconnects{0};
-    std::atomic<bool> warmed{false};
-    std::atomic<double> max_pkt_gap{0}, max_cb_gap{0};
-    std::atomic<uint64_t> pkt_gaps50{0}, pkt_gaps100{0}, pkt_gaps200{0}, pkt_gaps400{0}, cb_gaps40{0};
-    std::chrono::steady_clock::time_point last_pkt{}, last_cb{};   // single-writer each
-    std::atomic<bool> streaming{false};
-    std::atomic<bool> primed_pub{false};
-    std::atomic<float> peak{0}, peak_max{0}, rms{0};
-    std::atomic<double> ratio_pub{1.0};
-    std::atomic<int> target_pub{0};
-
-    std::mutex sink_mutex;
-    std::vector<AudioSink*> sinks;
-
-    mutable std::mutex text_mutex;
-    std::string state = "stopped";
-    std::string error;
-
-    void set_state(const std::string& s) {
-        std::lock_guard<std::mutex> g(text_mutex);
-        state = s;
-    }
-    void set_error(const std::string& e) {
-        std::lock_guard<std::mutex> g(text_mutex);
-        error = e;
-    }
-
-    void reset_session_stats() {
-        packets = 0; frames_in = 0; frames_out = 0; callbacks = 0;
-        drop_events = 0; dropped_frames = 0;
-        underruns = 0; underrun_frames = 0; underruns_at_warm = 0;
-        nonfinite_in = 0; nonfinite_out = 0; clipped = 0; reconnects = 0;
-        warmed = false; streaming = false; primed_pub = false;
-        max_pkt_gap = 0; max_cb_gap = 0; pkt_gaps50 = 0; pkt_gaps100 = 0;
-        pkt_gaps200 = 0; pkt_gaps400 = 0; cb_gaps40 = 0;
-        last_pkt = {}; last_cb = {};
-        peak = 0; peak_max = 0; rms = 0; ratio_pub = 1.0; target_pub = 0;
-    }
-
-    uint64_t target_frames() const {
-        int ms = delay_auto.load(std::memory_order_relaxed)
-                     ? (int)std::lround(auto_target_ms.load(std::memory_order_relaxed))
-                     : delay_ms.load(std::memory_order_relaxed);
-        ms = std::clamp(ms, 0, kMaxDelayMs);
-        uint64_t t = (uint64_t)((double)rate * ms / 1000.0);
-        return std::max<uint64_t>(t, kMinPrimeFrames);
-    }
-
-    // Producer: push stereo frames, dropping the oldest on overflow. ---------
-    void push(const float* frames, uint64_t n) {
-        if (n == 0) return;
-        if (n > cap) {   // single packet larger than the ring: keep the tail
-            dropped_frames += n - cap;
-            drop_events++;
-            frames += (n - cap) * 2;
-            n = cap;
-        }
-        SpinGuard g(ring_lock);
-        uint64_t used = write_pos - read_pos;
-        if (used + n > cap) {
-            uint64_t drop = used + n - cap;
-            read_pos += drop;
-            dropped_frames += drop;
-            drop_events++;
-        }
-        uint64_t at = write_pos % cap;
-        uint64_t first = std::min<uint64_t>(n, cap - at);
-        std::memcpy(&ring[at * 2], frames, first * 2 * sizeof(float));
-        if (first < n) std::memcpy(&ring[0], frames + first * 2, (n - first) * 2 * sizeof(float));
-        write_pos += n;
-    }
-
-    // Converts a payload packet to interleaved stereo float. -----------------
-    void ingest(const uint8_t* data, size_t len, std::vector<uint8_t>& carry,
-                std::vector<float>& out) {
-        size_t sample_bytes = sample_type == Sample::S16 ? 2 : 4;
-        size_t frame_bytes = sample_bytes * (size_t)in_channels;
-
-        const uint8_t* p = data;
-        size_t n = len;
-        std::vector<uint8_t> joined;
-        if (!carry.empty()) {
-            joined = carry;
-            joined.insert(joined.end(), data, data + len);
-            p = joined.data();
-            n = joined.size();
-            carry.clear();
-        }
-        size_t frames = n / frame_bytes;
-        size_t used = frames * frame_bytes;
-        if (used < n) carry.assign(p + used, p + n);
-
-        out.resize(frames * 2);
-        uint64_t bad = 0;
-        for (size_t f = 0; f < frames; f++) {
-            float ch[2] = {0.f, 0.f};
-            for (int c = 0; c < in_channels && c < 2; c++) {
-                const uint8_t* s = p + f * frame_bytes + (size_t)c * sample_bytes;
-                float v;
-                if (sample_type == Sample::F32) {
-                    uint32_t bits = (uint32_t)s[0] | ((uint32_t)s[1] << 8) |
-                                    ((uint32_t)s[2] << 16) | ((uint32_t)s[3] << 24);
-                    std::memcpy(&v, &bits, 4);
-                } else if (sample_type == Sample::S16) {
-                    int16_t i = (int16_t)((uint16_t)s[0] | ((uint16_t)s[1] << 8));
-                    v = (float)i / 32768.0f;
-                } else {
-                    int32_t i = (int32_t)((uint32_t)s[0] | ((uint32_t)s[1] << 8) |
-                                          ((uint32_t)s[2] << 16) | ((uint32_t)s[3] << 24));
-                    v = (float)((double)i / 2147483648.0);
-                }
-                if (!std::isfinite(v)) { v = 0.f; bad++; }
-                ch[c] = v;
-            }
-            if (in_channels == 1) ch[1] = ch[0];
-            out[f * 2] = ch[0];
-            out[f * 2 + 1] = ch[1];
-        }
-        if (bad) nonfinite_in += bad;
-        frames_in += frames;
-    }
-
-    // Consumer: SDL callback. No allocation, short critical section. ---------
-    void callback(float* out, int frames) {
-        callbacks++;
-        {
-            auto now = std::chrono::steady_clock::now();
-            if (last_cb.time_since_epoch().count() != 0) {
-                double gap = std::chrono::duration<double, std::milli>(now - last_cb).count();
-                if (gap > max_cb_gap.load(std::memory_order_relaxed))
-                    max_cb_gap.store(gap, std::memory_order_relaxed);
-                if (gap > 40.0) cb_gaps40++;
-            }
-            last_cb = now;
-        }
-        const bool en = enabled.load(std::memory_order_relaxed);
-        const float vol = std::clamp(volume.load(std::memory_order_relaxed), 0.0f, kMaxVolume);
-        const float gain_next = en ? vol : 0.0f;
-        const uint64_t target = target_frames();
-        target_pub.store((int)target, std::memory_order_relaxed);
-
-        int produced = 0;           // output frames backed by real data
-        double new_frac = frac;
-        int copied = 0;
-        int advance = 0;
-        double use_ratio = ratio;
-        bool rendering = false;
-
-        {
-            SpinGuard g(ring_lock);
-            uint64_t avail = write_pos - read_pos;
-            if (!primed && avail >= target) {
-                // Start at the target: a backlog burst on (re)connect would
-                // otherwise be played out 3 % fast for seconds.
-                if (avail > target + (uint64_t)kCallbackSamples) {
-                    read_pos += avail - target;
-                    avail = target;
-                }
-                primed = true;
-                first_prime_seen = true;
-                frac = 0.0;
-                level_avg = (double)avail;
-                ratio = 1.0;
-            }
-            rendering = primed;
-            if (primed) {
-                level_avg += ((double)avail - level_avg) * 0.02;
-                double err = level_avg - (double)target;
-                double want = 1.0;
-                if (std::fabs(err) > kDeadbandFrames) {
-                    double dev = std::min(kMaxRatioDeviation,
-                                          (std::fabs(err) - kDeadbandFrames) / (rate * 2.0));
-                    want = err > 0 ? 1.0 + dev : 1.0 - dev;
-                }
-                ratio += (want - ratio) * 0.1;
-                if (std::fabs(ratio - 1.0) < 1e-5 && want == 1.0) ratio = 1.0;
-                use_ratio = ratio;
-
-                // How many frames can we render from what is buffered?
-                // Output k reads source index floor(frac + k*ratio) and +1.
-                int max_copy = (int)std::min<uint64_t>(
-                    avail, (uint64_t)((double)frames * (1.0 + kMaxRatioDeviation)) + 4);
-                max_copy = std::min<int>(max_copy, (int)(scratch.size() / 2));
-                copied = max_copy;
-                uint64_t at = read_pos % cap;
-                uint64_t first = std::min<uint64_t>((uint64_t)copied, cap - at);
-                std::memcpy(scratch.data(), &ring[at * 2], first * 2 * sizeof(float));
-                if (first < (uint64_t)copied)
-                    std::memcpy(scratch.data() + first * 2, &ring[0],
-                                ((uint64_t)copied - first) * 2 * sizeof(float));
-
-                for (int k = 0; k < frames; k++) {
-                    int idx = (int)(frac + (double)k * use_ratio);
-                    if (idx + 1 >= copied) break;
-                    produced++;
-                }
-                double end = frac + (double)produced * use_ratio;
-                advance = (int)end;
-                new_frac = end - (double)advance;
-                read_pos += (uint64_t)advance;
-                if (produced < frames) {
-                    // Ran dry. Re-prime to the delay target instead of
-                    // stuttering on whatever trickles in.
-                    primed = false;
-                }
-            }
-        }
-
-        // Rendering happens outside the lock, from the private scratch copy.
-        const double start_frac = frac;
-        const float g0 = gain_prev;
-        float peak_cb = 0.f;
-        double sq = 0.0;
-        uint64_t clip = 0, bad = 0;
-
-        for (int k = 0; k < frames; k++) {
-            float l = 0.f, r = 0.f;
-            if (k < produced) {
-                double pos = start_frac + (double)k * use_ratio;
-                int i0 = (int)pos;
-                float f = (float)(pos - (double)i0);
-                const float* a = &scratch[(size_t)i0 * 2];
-                const float* b = a + 2;
-                if (f == 0.0f) { l = a[0]; r = a[1]; }
-                else {
-                    l = a[0] + (b[0] - a[0]) * f;
-                    r = a[1] + (b[1] - a[1]) * f;
-                }
-                float g = g0 + (gain_next - g0) * ((float)(k + 1) / (float)frames);
-                l *= g; r *= g;
-            }
-            if (!std::isfinite(l)) { l = 0.f; bad++; }
-            if (!std::isfinite(r)) { r = 0.f; bad++; }
-            if (l > 1.f) { l = 1.f; clip++; } else if (l < -1.f) { l = -1.f; clip++; }
-            if (r > 1.f) { r = 1.f; clip++; } else if (r < -1.f) { r = -1.f; clip++; }
-            out[k * 2] = l;
-            out[k * 2 + 1] = r;
-            peak_cb = std::max(peak_cb, std::max(std::fabs(l), std::fabs(r)));
-            sq += (double)l * l + (double)r * r;
-        }
-
-        gain_prev = gain_next;
-        frac = new_frac;
-
-        frames_out += (uint64_t)produced;
-        if (clip) clipped += clip;
-        if (bad) nonfinite_out += bad;
-        float prev_peak = peak.load(std::memory_order_relaxed);
-        peak.store(std::max(peak_cb, prev_peak * 0.9f), std::memory_order_relaxed);
-        relaxed_max(peak_max, peak_cb);
-        rms.store((float)std::sqrt(sq / (double)(frames * 2)), std::memory_order_relaxed);
-        ratio_pub.store(use_ratio, std::memory_order_relaxed);
-        primed_pub.store(primed, std::memory_order_relaxed);
-        level_pub.store(primed ? level_avg : -1.0, std::memory_order_relaxed);
-
-        if (rendering && produced < frames) {
-            underruns++;
-            underrun_frames += (uint64_t)(frames - produced);
-            auto_boost.store(true, std::memory_order_relaxed);
-        }
-
-        if (first_prime_seen) {
-            warm_frames += frames;
-            if (!warmed.load(std::memory_order_relaxed) && warm_frames >= kWarmupSeconds * rate) {
-                underruns_at_warm.store(underruns.load());
-                warmed.store(true);
-            }
-        }
-    }
-};
+// --- SDL audio subsystem ------------------------------------------------------------
 
 namespace {
-
-void SDLCALL sdl_callback(void* userdata, Uint8* stream, int len) {
-    auto* impl = static_cast<AudioPlayer::Impl*>(userdata);
-    impl->callback(reinterpret_cast<float*>(stream), len / (int)(2 * sizeof(float)));
+std::mutex g_sdl_mutex;
+int g_sdl_refs = 0;
 }
 
-} // namespace
-
-int process_thread_count() {
-#ifdef _WIN32
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-    if (snap == INVALID_HANDLE_VALUE) return -1;
-    THREADENTRY32 entry;
-    entry.dwSize = sizeof(entry);
-    DWORD pid = GetCurrentProcessId();
-    int count = 0;
-    if (Thread32First(snap, &entry)) {
-        do {
-            if (entry.th32OwnerProcessID == pid) count++;
-        } while (Thread32Next(snap, &entry));
-    }
-    CloseHandle(snap);
-    return count;
-#else
-    return -1;
-#endif
-}
-
-AudioPlayer::AudioPlayer() : impl_(new Impl) {}
-
-AudioPlayer::~AudioPlayer() {
-    stop();
-}
-
-void AudioPlayer::set_enabled(bool on) { impl_->enabled.store(on); }
-bool AudioPlayer::enabled() const { return impl_->enabled.load(); }
-void AudioPlayer::set_volume(float v) {
-    if (!std::isfinite(v)) v = 1.0f;
-    impl_->volume.store(std::clamp(v, 0.0f, kMaxVolume));
-}
-float AudioPlayer::volume() const { return impl_->volume.load(); }
-void AudioPlayer::set_delay_ms(int ms) { impl_->delay_ms.store(std::clamp(ms, 0, kMaxDelayMs)); }
-int AudioPlayer::delay_ms() const { return impl_->delay_ms.load(); }
-void AudioPlayer::set_delay_auto(bool on) { impl_->delay_auto.store(on); }
-void AudioPlayer::set_auto_floor_ms(int ms) { impl_->auto_floor_ms.store(std::clamp(ms, 30, kMaxDelayMs)); }
-bool AudioPlayer::delay_auto() const { return impl_->delay_auto.load(); }
-
-int AudioPlayer::effective_delay_ms() const {
-    const Impl& s = *impl_;
-    int ms = s.delay_auto.load() ? (int)std::lround(s.auto_target_ms.load()) : s.delay_ms.load();
-    return std::clamp(ms, 0, kMaxDelayMs);
-}
-
-double AudioPlayer::playout_latency_ms() const {
-    const Impl& s = *impl_;
-    if (!s.running.load() || !s.enabled.load()) return -1.0;
-    double level = s.level_pub.load(std::memory_order_relaxed);
-    int rate = s.rate_pub.load();
-    if (level < 0 || rate <= 0) return -1.0;
-    // Ring wait + one SDL buffer + an allowance for the OS mixer.
-    return 1000.0 * (level + kCallbackSamples) / rate + 10.0;
-}
-
-bool AudioPlayer::active() const {
-    return impl_->running.load();
-}
-
-std::string AudioPlayer::last_error() const {
-    std::lock_guard<std::mutex> g(impl_->text_mutex);
-    return impl_->error;
-}
-
-void AudioPlayer::add_sink(AudioSink* sink) {
-    std::lock_guard<std::mutex> g(impl_->sink_mutex);
-    auto& v = impl_->sinks;
-    if (sink && std::find(v.begin(), v.end(), sink) == v.end()) v.push_back(sink);
-}
-
-void AudioPlayer::remove_sink(AudioSink* sink) {
-    std::lock_guard<std::mutex> g(impl_->sink_mutex);
-    auto& v = impl_->sinks;
-    v.erase(std::remove(v.begin(), v.end(), sink), v.end());
-}
-
-bool AudioPlayer::start(const std::string& base_url, const StreamConfig& config) {
-    stop();
-    Impl& s = *impl_;
-    std::lock_guard<std::mutex> life(s.life);
-
-    s.reset_session_stats();
-    s.set_error("");
-
-    if (!config.has_audio) {
-        s.set_state("no audio channel");
-        return false;
-    }
-
-    const std::string& codec = config.audio_codec;
-    if (codec == "pcm_s16le" || (codec.empty() && config.audio_bits == 16)) s.sample_type = Sample::S16;
-    else if (codec == "pcm_s32le") s.sample_type = Sample::S32;
-    else if (codec == "pcm_f32le" || codec.empty()) s.sample_type = Sample::F32;
-    else {
-        s.set_state("unsupported audio codec");
-        s.set_error("unsupported audio codec: " + codec);
-        return false;
-    }
-    s.in_channels = std::clamp(config.audio_channels > 0 ? config.audio_channels : 2, 1, 8);
-    s.rate = config.audio_rate > 0 ? config.audio_rate : 48000;
-    s.base_url = base_url;
-    s.rate_pub.store(s.rate);
-    {
-        char text[96];
-        std::snprintf(text, sizeof(text), "%s %dch %d Hz",
-                      codec.empty() ? "pcm_f32le" : codec.c_str(), s.in_channels, s.rate);
-        std::lock_guard<std::mutex> g(s.text_mutex);
-        s.format_text = text;
-    }
-
-    if (SDL_InitSubSystem(SDL_INIT_AUDIO) != 0) {
-        s.set_state("audio unavailable");
-        s.set_error(std::string("SDL audio init: ") + SDL_GetError());
-        return false;
-    }
-    s.sdl_inited = true;
-
-    SDL_AudioSpec want, have;
-    SDL_zero(want);
-    want.freq = s.rate;
-    want.format = AUDIO_F32SYS;
-    want.channels = 2;
-    want.samples = kCallbackSamples;
-    want.callback = sdl_callback;
-    want.userdata = &s;
-    s.device = SDL_OpenAudioDevice(nullptr, 0, &want, &have, 0);  // SDL converts if needed
-    if (s.device == 0) {
-        s.set_state("audio device failed");
-        s.set_error(std::string("SDL_OpenAudioDevice: ") + SDL_GetError());
-        SDL_QuitSubSystem(SDL_INIT_AUDIO);
-        s.sdl_inited = false;
-        return false;
-    }
-    const char* name = SDL_GetAudioDeviceName(0, 0);
-    {
-        std::lock_guard<std::mutex> g(s.text_mutex);
-        s.device_name = name ? name : "default";
-    }
-
-    // Reset ring/callback state before the device starts pulling.
-    s.cap = (uint64_t)(kRingSeconds * s.rate);
-    s.ring.assign((size_t)s.cap * 2, 0.0f);
-    s.scratch.assign((size_t)(have.samples * 2 + 64) * 2, 0.0f);
-    s.write_pos = s.read_pos = 0;
-    s.primed = false;
-    s.first_prime_seen = false;
-    s.frac = 0.0;
-    s.level_avg = 0.0;
-    s.level_pub.store(-1.0);
-    s.ratio = 1.0;
-    s.gap_peak_ms = kAutoInitialGapMs;
-    s.jitter_init = false;
-    s.auto_target_ms.store((float)(kAutoInitialGapMs + kAutoMarginMs));
-    s.auto_boost.store(false);
-    s.gain_prev = s.enabled.load() ? s.volume.load() : 0.0f;
-    s.warm_frames = 0.0;
-
-    s.stop_flag.store(false);
-    s.set_state("buffering");
-    s.thread = std::thread([&s]() {
-#ifdef _WIN32
-        // The software H.264 decode saturates the CPU; keep payload audio ahead of it.
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
-#endif
-        std::vector<uint8_t> carry;
-        std::vector<float> converted;
-        PayloadClient client(s.base_url);
-        while (!s.stop_flag.load()) {
-            std::string err;
-            s.streaming = true;
-            s.jitter_init = false;   // new connection: new arrival/media baseline
-            client.stream_audio(
-                [&](const uint8_t* pcm, size_t len, uint32_t) {
-                    if (s.stop_flag.load()) return false;
-                    s.packets++;
-                    {
-                        auto now = std::chrono::steady_clock::now();
-                        if (s.last_pkt.time_since_epoch().count() != 0) {
-                            double gap = std::chrono::duration<double, std::milli>(
-                                now - s.last_pkt).count();
-                            if (gap > s.max_pkt_gap.load(std::memory_order_relaxed))
-                                s.max_pkt_gap.store(gap, std::memory_order_relaxed);
-                            if (gap > 50.0) s.pkt_gaps50++;
-                            if (gap > 100.0) s.pkt_gaps100++;
-                            if (gap > 200.0) s.pkt_gaps200++;
-                            if (gap > 400.0) s.pkt_gaps400++;
-                        }
-                        // Lateness of this packet against the media clock. Not
-                        // measured for 2 s after (re)connecting: the payload
-                        // flushes its audio backlog in a burst, which would
-                        // read as huge lateness and pin the buffer at maximum.
-                        if (s.jitter_init && now >= s.jitter_settle_until) {
-                            double gap = std::chrono::duration<double, std::milli>(now - s.last_pkt).count();
-                            double media_ms = 1000.0 * (double)(s.frames_in.load() - s.jitter_frames0) / s.rate;
-                            double arrival_ms = std::chrono::duration<double, std::milli>(
-                                now - s.jitter_t0).count();
-                            double lateness = arrival_ms - media_ms;
-                            // Baseline = earliest arrival seen, allowed to creep
-                            // up 2 ms/s so it follows clock drift.
-                            s.jitter_baseline_ms = std::min(lateness, s.jitter_baseline_ms + 2.0 * gap / 1000.0);
-                            double excess = lateness - s.jitter_baseline_ms;
-                            s.gap_peak_ms = std::max(
-                                excess, s.gap_peak_ms * std::pow(0.5, gap / 1000.0 / kAutoHalfLifeS));
-                        }
-                        if (!s.jitter_init || now < s.jitter_settle_until) {
-                            if (!s.jitter_init) s.jitter_settle_until = now + std::chrono::seconds(2);
-                            s.jitter_init = true;
-                            s.jitter_t0 = now;
-                            s.jitter_frames0 = s.frames_in.load();
-                            s.jitter_baseline_ms = 0.0;
-                        }
-                        if (s.auto_boost.exchange(false)) {
-                            // We ran dry anyway: buffer deeper right away.
-                            s.gap_peak_ms = std::max(
-                                s.gap_peak_ms, s.auto_target_ms.load() * 1.5 - kAutoMarginMs);
-                        }
-                        s.auto_target_ms.store((float)std::clamp(
-                            s.gap_peak_ms + kAutoMarginMs, (double)s.auto_floor_ms.load(), (double)kMaxDelayMs));
-                        s.last_pkt = now;
-                    }
-                    s.ingest(pcm, len, carry, converted);
-                    s.push(converted.data(), converted.size() / 2);
-                    {
-                        std::lock_guard<std::mutex> g(s.sink_mutex);
-                        for (AudioSink* sink : s.sinks)
-                            sink->on_audio(converted.data(), converted.size() / 2, s.rate);
-                    }
-                    return !s.stop_flag.load();
-                },
-                s.stop_flag, err, 3000);
-            s.streaming = false;
-            carry.clear();
-            if (s.stop_flag.load()) break;
-            s.reconnects++;
-            s.set_error(err.empty() ? "audio stream closed" : "audio: " + err);
-            for (int i = 0; i < 10 && !s.stop_flag.load(); i++)
-                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+bool sdl_audio_acquire(std::string& error)
+{
+    std::lock_guard<std::mutex> lock(g_sdl_mutex);
+    if (g_sdl_refs == 0) {
+        SDL_SetMainReady();
+        if (SDL_InitSubSystem(SDL_INIT_AUDIO) != 0) {
+            error = SDL_GetError();
+            return false;
         }
-        s.streaming = false;
-    });
-
-    s.device_pub.store(true);
-    s.running.store(true);
-    SDL_PauseAudioDevice(s.device, 0);
+    }
+    g_sdl_refs++;
     return true;
 }
 
-void AudioPlayer::stop() {
-    Impl& s = *impl_;
-    std::lock_guard<std::mutex> life(s.life);
-    if (!s.thread.joinable() && s.device == 0 && !s.sdl_inited) return;
-
-    s.running.store(false);
-    s.stop_flag.store(true);
-    if (s.thread.joinable()) s.thread.join();
-    if (s.device) {
-        SDL_PauseAudioDevice(s.device, 1);
-        SDL_CloseAudioDevice(s.device);   // returns after the callback has finished
-        s.device = 0;
-    }
-    s.device_pub.store(false);
-    if (s.sdl_inited) {
-        SDL_QuitSubSystem(SDL_INIT_AUDIO);
-        s.sdl_inited = false;
-    }
-    {
-        SpinGuard g(s.ring_lock);          // drain
-        s.write_pos = s.read_pos = 0;
-        s.primed = false;
-    }
-    s.streaming = false;
-    s.primed_pub = false;
-    s.set_state("stopped");
+void sdl_audio_release()
+{
+    std::lock_guard<std::mutex> lock(g_sdl_mutex);
+    if (g_sdl_refs <= 0) return;
+    if (--g_sdl_refs == 0) SDL_QuitSubSystem(SDL_INIT_AUDIO);
 }
 
-AudioStats AudioPlayer::stats() const {
-    const Impl& s = *impl_;
-    AudioStats st;
-    st.device_open = s.device_pub.load();
-    st.streaming = s.streaming.load();
-    st.primed = s.primed_pub.load();
-    st.rate = s.rate_pub.load();
-    {
-        std::lock_guard<std::mutex> g(s.text_mutex);
-        st.state = s.state;
-        st.format = s.format_text;
-        st.device = s.device_name;
+int process_thread_count()
+{
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return -1;
+    DWORD pid = GetCurrentProcessId();
+    THREADENTRY32 te;
+    te.dwSize = sizeof(te);
+    int count = 0;
+    if (Thread32First(snap, &te)) {
+        do {
+            if (te.th32OwnerProcessID == pid) count++;
+            te.dwSize = sizeof(te);
+        } while (Thread32Next(snap, &te));
     }
-    st.packets = s.packets; st.frames_in = s.frames_in; st.frames_out = s.frames_out;
-    st.callbacks = s.callbacks;
-    st.drop_events = s.drop_events; st.dropped_frames = s.dropped_frames;
-    st.underruns = s.underruns; st.underrun_frames = s.underrun_frames;
-    st.warmed_up = s.warmed.load();
-    st.underruns_after_warmup = st.warmed_up ? st.underruns - s.underruns_at_warm.load() : 0;
-    st.nonfinite_in = s.nonfinite_in; st.nonfinite_out = s.nonfinite_out;
-    st.clipped_samples = s.clipped; st.reconnects = s.reconnects;
-    st.ratio = s.ratio_pub.load();
-    st.peak = s.peak.load(); st.peak_max = s.peak_max.load(); st.rms = s.rms.load();
-    st.max_packet_gap_ms = s.max_pkt_gap.load();
-    st.packet_gaps_50ms = s.pkt_gaps50; st.packet_gaps_100ms = s.pkt_gaps100;
-    st.packet_gaps_200ms = s.pkt_gaps200; st.packet_gaps_400ms = s.pkt_gaps400;
-    st.max_callback_gap_ms = s.max_cb_gap.load();
-    st.auto_delay = s.delay_auto.load();
-    st.playout_ms = playout_latency_ms();
-    st.callback_gaps_40ms = s.cb_gaps40;
-    int rate = st.rate;
-    st.target_ms = rate ? 1000.0 * s.target_pub.load() / rate : 0.0;
-    uint64_t used = 0;
-    if (st.device_open) {
-        SpinGuard g(s.ring_lock);
-        used = s.write_pos - s.read_pos;
-    }
-    st.buffered_ms = rate ? 1000.0 * (double)used / rate : 0.0;
-    if (st.state == "buffering" && st.primed) st.state = "playing";
-    return st;
+    CloseHandle(snap);
+    return count;
 }
 
-} // namespace glint
+// --- player ---------------------------------------------------------------------------
+
+namespace {
+
+using Clock = std::chrono::steady_clock;
+
+double ms_between(Clock::time_point a, Clock::time_point b)
+{
+    return std::chrono::duration<double, std::milli>(b - a).count();
+}
+
+enum class Sample { F32, S16, S32 };
+
+constexpr double kRingSeconds = 3.0;
+constexpr double kMixerAllowanceMs = 10.0;
+constexpr double kMarginMs = 15.0;   // an underrun raises the target by half at once
+constexpr double kStartTargetMs = 95.0;
+constexpr double kIgnoreAfterConnectS = 2.0;
+constexpr double kOutageMs = 250.0;   // later than this is a stall, not network jitter
+constexpr double kWarmupS = 5.0;
+
+}  // namespace
+
+struct AudioPlayer::Impl {
+    // Settings, readable from any thread.
+    std::atomic<bool> enabled{true};
+    std::atomic<float> volume{1.0f};
+    std::atomic<int> delay_ms{250};
+    std::atomic<bool> delay_auto{true};
+    std::atomic<int> floor_ms{40};
+    std::atomic<double> auto_target_ms{kStartTargetMs};
+    std::atomic<bool> underrun_bump{false};
+
+    // Session.
+    std::mutex session_mutex;
+    std::atomic<bool> active{false};
+    std::atomic<bool> streaming{false};
+    std::atomic<bool> net_stop{false};
+    std::thread net;
+    SDL_AudioDeviceID dev = 0;
+    std::string url;
+    int rate = 48000;
+    int channels = 2;
+    Sample sample = Sample::F32;
+    int device_frames = 512;
+
+    // Ring and playback state, under ring_mutex (the callback takes it briefly).
+    mutable std::mutex ring_mutex;
+    std::vector<float> ring;   // stereo frames
+    size_t cap = 0, rd = 0, count = 0;
+    bool primed = false;
+    double pos = 0.0;          // fractional read position for the resampler
+    double ratio = 1.0;
+    double level_ms = 0.0;     // smoothed buffer level
+    float gain = 0.0f;         // gain applied at the end of the last callback
+    Clock::time_point last_callback{};
+    Clock::time_point first_prime{};
+    bool ever_primed = false;
+    AudioStats st;             // counters (strings live under info_mutex)
+    std::atomic<double> playout{-1.0};
+    std::vector<float> scratch;   // callback input copy, sized at session start
+
+    mutable std::mutex info_mutex;
+    std::string state = "Stopped";
+    std::string device;
+    std::string format;
+    std::string last_error;
+
+    std::mutex sink_mutex;
+    Sink sink;
+
+    double min_workable_ms() const { return 2.0 * device_frames * 1000.0 / rate + 5.0; }
+
+    double target_ms() const
+    {
+        double t = delay_auto.load() ? auto_target_ms.load() : (double)delay_ms.load();
+        return std::clamp(std::max(t, min_workable_ms()), 0.0, 400.0);
+    }
+
+    void set_info(const char* new_state, const std::string& error)
+    {
+        std::lock_guard<std::mutex> lock(info_mutex);
+        state = new_state;
+        if (!error.empty()) last_error = error;
+    }
+
+    // Drops `n` of the oldest frames (ring_mutex held).
+    void drop_oldest(size_t n)
+    {
+        n = std::min(n, count);
+        rd = (rd + n) % cap;
+        count -= n;
+    }
+
+    void push(const float* stereo, size_t frames)
+    {
+        std::lock_guard<std::mutex> lock(ring_mutex);
+        if (frames > cap) {
+            stereo += (frames - cap) * 2;
+            frames = cap;
+        }
+        if (count + frames > cap) {
+            size_t over = count + frames - cap;
+            drop_oldest(over);
+            st.drop_events++;
+            st.dropped_frames += over;
+        }
+        size_t wr = (rd + count) % cap;
+        for (size_t i = 0; i < frames; i++) {
+            ring[wr * 2] = stereo[i * 2];
+            ring[wr * 2 + 1] = stereo[i * 2 + 1];
+            if (++wr == cap) wr = 0;
+        }
+        count += frames;
+    }
+
+    static void SDLCALL callback(void* user, Uint8* stream, int len)
+    {
+        ((Impl*)user)->fill((float*)stream, (size_t)len / (2 * sizeof(float)));
+    }
+
+    void fill(float* out, size_t n)
+    {
+        Clock::time_point now = Clock::now();
+        const double target = target_ms();
+        const size_t target_frames = (size_t)(target * rate / 1000.0);
+        size_t got = 0;            // input frames copied to scratch
+        double start_pos = 0.0, step = 1.0;
+        bool play = false;
+        {
+            std::lock_guard<std::mutex> lock(ring_mutex);
+            st.callbacks++;
+            if (last_callback.time_since_epoch().count() != 0) {
+                double gap = ms_between(last_callback, now);
+                st.max_callback_gap_ms = std::max(st.max_callback_gap_ms, gap);
+                if (gap > 40.0) st.callback_gaps_40ms++;
+            }
+            last_callback = now;
+            st.target_ms = target;
+
+            if (!primed && count >= target_frames && count > 0) {
+                if (count > target_frames + (size_t)device_frames) drop_oldest(count - target_frames);
+                primed = true;
+                pos = 0.0;
+                level_ms = count * 1000.0 / rate;
+                if (!ever_primed) {
+                    ever_primed = true;
+                    first_prime = now;
+                }
+            }
+            if (primed && count > target_frames + std::max<size_t>(2 * (size_t)device_frames, (size_t)rate / 20)) {
+                // A backlog after a stall (the console sends what it held back in one burst):
+                // drift correction at 3 % would take tens of seconds to catch up, so skip it.
+                st.drop_events++;
+                st.dropped_frames += count - target_frames;
+                drop_oldest(count - target_frames);
+                level_ms = count * 1000.0 / rate;
+            }
+            if (primed) {
+                // Drift correction: nudge the playback rate so the level sits on the target.
+                double level = count * 1000.0 / rate;
+                level_ms += (level - level_ms) * 0.05;
+                double err = level_ms - target;
+                double want = 1.0;
+                if (std::fabs(err) > 10.0) want = 1.0 + std::clamp((err - std::copysign(10.0, err)) * 0.0004, -0.03, 0.03);
+                ratio += std::clamp(want - ratio, -0.0005, 0.0005);
+                step = ratio;
+                start_pos = pos;
+                size_t need = (size_t)std::floor(pos + (double)(n - 1) * step) + 2;
+                got = std::min(need, count);
+                size_t idx = rd;
+                for (size_t i = 0; i < got; i++) {
+                    scratch[i * 2] = ring[idx * 2];
+                    scratch[i * 2 + 1] = ring[idx * 2 + 1];
+                    if (++idx == cap) idx = 0;
+                }
+                if (got < need) {
+                    // Ran dry: play what there is, then wait for the target again.
+                    drop_oldest(got);
+                    primed = false;
+                    st.underruns++;
+                    if (ever_primed && ms_between(first_prime, now) > kWarmupS * 1000.0) st.underruns_after_warmup++;
+                    underrun_bump.store(true);
+                    if (delay_auto.load())
+                        auto_target_ms.store(std::min(400.0, std::max(auto_target_ms.load(), target) * 1.5));
+                } else {
+                    size_t used = (size_t)std::floor(pos + (double)n * step);
+                    drop_oldest(std::min(used, count));
+                    pos = pos + (double)n * step - (double)used;
+                }
+                play = true;
+            }
+            st.buffered_ms = count * 1000.0 / rate;
+            st.ratio = primed ? ratio : 1.0;
+        }
+
+        // Resample (linear) and apply the gain ramp outside the lock.
+        float g1 = enabled.load() ? std::clamp(volume.load(), 0.0f, 4.0f) : 0.0f;
+        float g0 = gain;
+        size_t produced = 0;
+        uint64_t clipped = 0, nonfinite = 0;
+        float peak = 0.0f;
+        double sum_sq = 0.0;
+        for (size_t i = 0; i < n; i++) {
+            float l = 0.0f, r = 0.0f;
+            if (play) {
+                double p = start_pos + (double)i * step;
+                size_t a = (size_t)p;
+                if (a + 1 < got) {
+                    float f = (float)(p - (double)a);
+                    l = scratch[a * 2] + (scratch[a * 2 + 2] - scratch[a * 2]) * f;
+                    r = scratch[a * 2 + 1] + (scratch[a * 2 + 3] - scratch[a * 2 + 1]) * f;
+                    produced++;
+                }
+            }
+            float g = g0 + (g1 - g0) * (float)(i + 1) / (float)n;
+            float s[2] = {l * g, r * g};
+            for (float& x : s) {
+                if (!std::isfinite(x)) {
+                    x = 0.0f;
+                    nonfinite++;
+                }
+                if (x > 1.0f || x < -1.0f) {
+                    x = x > 0 ? 1.0f : -1.0f;
+                    clipped++;
+                }
+                peak = std::max(peak, std::fabs(x));
+                sum_sq += (double)x * x;
+            }
+            out[i * 2] = s[0];
+            out[i * 2 + 1] = s[1];
+        }
+        gain = g1;
+
+        std::lock_guard<std::mutex> lock(ring_mutex);
+        st.frames_out += produced;
+        if (play && produced < n && !primed) st.underrun_frames += n - produced;
+        st.clipped_samples += clipped;
+        st.nonfinite_out += nonfinite;
+        st.peak = std::max(peak, st.peak * 0.85f);
+        st.peak_max = std::max(st.peak_max, peak);
+        st.rms = (float)std::sqrt(sum_sq / (double)(n * 2));
+        if (ever_primed) st.warmed_up = ms_between(first_prime, now) > kWarmupS * 1000.0;
+        st.primed = primed;
+        bool on = primed && enabled.load();
+        playout.store(on ? level_ms + device_frames * 1000.0 / rate + kMixerAllowanceMs : -1.0);
+    }
+
+    void network_loop()
+    {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+        const size_t in_frame = (size_t)channels * (sample == Sample::S16 ? 2 : 4);
+        std::vector<uint8_t> carry;
+        std::vector<float> stereo;
+        bool first_connect = true;
+
+        while (!net_stop.load()) {
+            if (!first_connect) {
+                std::lock_guard<std::mutex> lock(ring_mutex);
+                st.reconnects++;
+            }
+            first_connect = false;
+            carry.clear();
+            Clock::time_point connected_at = Clock::now();
+            Clock::time_point last_packet{};
+            bool measuring = false;
+            double base = 0.0, last_t = 0.0;
+            double peak_late = 0.0;
+            double ignore_until = 0.0;
+            uint64_t media_frames = 0;
+
+            auto on_packet = [&](const uint8_t* data, size_t len, uint32_t) {
+                Clock::time_point now = Clock::now();
+                streaming.store(true);
+                // Raw bytes to stereo float; a frame split across packets waits for the rest.
+                carry.insert(carry.end(), data, data + len);
+                size_t frames = carry.size() / in_frame;
+                stereo.resize(frames * 2);
+                uint64_t bad = 0;
+                for (size_t i = 0; i < frames; i++) {
+                    const uint8_t* f = carry.data() + i * in_frame;
+                    float ch[2];
+                    for (int c = 0; c < 2; c++) {
+                        int src = std::min(c, channels - 1);
+                        float v;
+                        if (sample == Sample::F32) {
+                            std::memcpy(&v, f + src * 4, 4);
+                            if (!std::isfinite(v)) {
+                                v = 0.0f;
+                                if (c == src) bad++;
+                            }
+                        } else if (sample == Sample::S16) {
+                            int16_t x;
+                            std::memcpy(&x, f + src * 2, 2);
+                            v = (float)x / 32768.0f;
+                        } else {
+                            int32_t x;
+                            std::memcpy(&x, f + src * 4, 4);
+                            v = (float)((double)x / 2147483648.0);
+                        }
+                        ch[c] = v;
+                    }
+                    stereo[i * 2] = ch[0];
+                    stereo[i * 2 + 1] = ch[1];
+                }
+                carry.erase(carry.begin(), carry.begin() + (ptrdiff_t)(frames * in_frame));
+
+                {
+                    std::lock_guard<std::mutex> lock(ring_mutex);
+                    st.packets++;
+                    st.frames_in += frames;
+                    st.nonfinite_in += bad;
+                    if (last_packet.time_since_epoch().count() != 0) {
+                        double gap = ms_between(last_packet, now);
+                        st.max_packet_gap_ms = std::max(st.max_packet_gap_ms, gap);
+                        if (gap > 50) st.packet_gaps_50ms++;
+                        if (gap > 100) st.packet_gaps_100ms++;
+                        if (gap > 200) st.packet_gaps_200ms++;
+                        if (gap > 400) st.packet_gaps_400ms++;
+                    }
+                }
+                last_packet = now;
+                if (frames) push(stereo.data(), frames);
+                {
+                    std::lock_guard<std::mutex> lock(sink_mutex);
+                    if (sink && frames) sink(stereo.data(), frames, rate, now);
+                }
+
+                // Automatic target: how late packets arrive against the media clock.
+                double t = std::chrono::duration<double>(now - connected_at).count();
+                double offset = t - (double)media_frames / rate;
+                media_frames += frames;
+                if (measuring && (offset - base) * 1000.0 > kOutageMs) {
+                    // An outage, not jitter: no buffer would have covered it, so it must not
+                    // hold the target up for a minute. Measure afresh once its backlog is in.
+                    measuring = false;
+                    ignore_until = t + kIgnoreAfterConnectS;
+                }
+                if (t >= kIgnoreAfterConnectS && t >= ignore_until) {
+                    if (!measuring) {
+                        measuring = true;
+                        base = offset;
+                        last_t = t;
+                    }
+                    double dt = t - last_t;
+                    last_t = t;
+                    base = std::min(base + 0.002 * dt, offset);   // follows clock drift slowly
+                    double late_ms = (offset - base) * 1000.0;
+                    peak_late = std::max(late_ms, peak_late * std::exp(-dt / 20.0));
+                    if (underrun_bump.exchange(false))
+                        peak_late = std::max(peak_late, auto_target_ms.load() - kMarginMs);
+                    double floor = (double)floor_ms.load();
+                    auto_target_ms.store(std::clamp(peak_late + kMarginMs, floor, 400.0));
+                }
+                return !net_stop.load();
+            };
+
+            PayloadClient client(url);
+            std::string error;
+            bool ok = client.stream_audio(on_packet, net_stop, error, 3000);
+            streaming.store(false);
+            if (net_stop.load()) break;
+            std::string why = ok ? "The audio stream ended." : "Audio stream: " + error;
+            set_info("Reconnecting", why);
+            logf("audio: %s; reconnecting", why.c_str());
+            for (int i = 0; i < 10 && !net_stop.load(); i++) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
+};
+
+AudioPlayer::AudioPlayer() : impl_(new Impl) {}
+
+AudioPlayer::~AudioPlayer()
+{
+    stop_session();
+}
+
+void AudioPlayer::set_enabled(bool on)
+{
+    impl_->enabled.store(on);
+}
+
+bool AudioPlayer::enabled() const
+{
+    return impl_->enabled.load();
+}
+
+void AudioPlayer::set_volume(float v)
+{
+    if (!std::isfinite(v)) v = 1.0f;
+    impl_->volume.store(std::clamp(v, 0.0f, 4.0f));
+}
+
+float AudioPlayer::volume() const
+{
+    return impl_->volume.load();
+}
+
+void AudioPlayer::set_delay_ms(int ms)
+{
+    impl_->delay_ms.store(std::clamp(ms, 0, 400));
+}
+
+int AudioPlayer::delay_ms() const
+{
+    return impl_->delay_ms.load();
+}
+
+void AudioPlayer::set_delay_auto(bool on)
+{
+    impl_->delay_auto.store(on);
+}
+
+bool AudioPlayer::delay_auto() const
+{
+    return impl_->delay_auto.load();
+}
+
+int AudioPlayer::effective_delay_ms() const
+{
+    return (int)std::lround(impl_->target_ms());
+}
+
+bool AudioPlayer::active() const
+{
+    return impl_->active.load();
+}
+
+std::string AudioPlayer::last_error() const
+{
+    std::lock_guard<std::mutex> lock(impl_->info_mutex);
+    return impl_->last_error;
+}
+
+AudioStats AudioPlayer::stats() const
+{
+    Impl& d = *impl_;
+    AudioStats s;
+    {
+        std::lock_guard<std::mutex> lock(d.ring_mutex);
+        s = d.st;
+        s.primed = d.active.load() && d.primed;
+        s.buffered_ms = d.active.load() ? d.count * 1000.0 / d.rate : 0.0;
+    }
+    s.device_open = d.active.load();
+    s.streaming = d.streaming.load();
+    s.auto_delay = d.delay_auto.load();
+    s.playout_ms = d.active.load() ? d.playout.load() : -1.0;
+    {
+        std::lock_guard<std::mutex> lock(d.info_mutex);
+        s.state = d.state;
+        s.device = d.device;
+        s.format = d.format;
+    }
+    if (d.active.load()) s.state = !s.streaming ? "Connecting" : s.primed ? "Playing" : "Buffering";
+    return s;
+}
+
+bool AudioPlayer::start_session(const std::string& url, const StreamConfig& config)
+{
+    stop_session();
+    Impl& d = *impl_;
+    std::lock_guard<std::mutex> lock(d.session_mutex);
+    {
+        std::lock_guard<std::mutex> rl(d.ring_mutex);
+        d.st = AudioStats();
+        d.st.rate = config.audio_rate;
+        d.primed = false;
+        d.ever_primed = false;
+        d.ratio = 1.0;
+        d.gain = 0.0f;
+        d.last_callback = Clock::time_point{};
+    }
+    d.auto_target_ms.store(std::max(kStartTargetMs, (double)d.floor_ms.load()));
+    d.underrun_bump.store(false);
+    d.playout.store(-1.0);
+    {
+        std::lock_guard<std::mutex> il(d.info_mutex);
+        d.last_error.clear();
+        d.device.clear();
+        d.format.clear();
+    }
+
+    if (!config.has_audio) {
+        d.set_info("No audio channel", "The console is not sending sound.");
+        return false;
+    }
+    std::string codec = config.audio_codec;
+    if (codec.empty()) codec = config.audio_bits == 16 ? "pcm_s16le" : "pcm_f32le";
+    {
+        std::lock_guard<std::mutex> il(d.info_mutex);
+        d.format = codec + " " + std::to_string(config.audio_channels) + "ch " + std::to_string(config.audio_rate) + " Hz";
+    }
+    if (codec == "pcm_f32le") d.sample = Sample::F32;
+    else if (codec == "pcm_s16le") d.sample = Sample::S16;
+    else if (codec == "pcm_s32le") d.sample = Sample::S32;
+    else {
+        d.set_info("Unsupported audio format", "The sound format " + codec + " is not supported.");
+        return false;
+    }
+    if (config.audio_channels < 1 || config.audio_rate < 8000 || config.audio_rate > 192000) {
+        d.set_info("Unsupported audio format", "The sound format is not usable.");
+        return false;
+    }
+    d.rate = config.audio_rate;
+    d.channels = config.audio_channels;
+    d.url = url;
+
+    std::string error;
+    if (!sdl_audio_acquire(error)) {
+        d.set_info("Audio unavailable", "Sound output could not start: " + error);
+        return false;
+    }
+    SDL_AudioSpec want{}, have{};
+    want.freq = d.rate;
+    want.format = AUDIO_F32SYS;
+    want.channels = 2;
+    want.samples = 512;   // ~10.7 ms: each buffer is latency, and the minimum buffer is two of them
+    want.callback = &Impl::callback;
+    want.userdata = &d;
+    d.dev = SDL_OpenAudioDevice(nullptr, 0, &want, &have, 0);
+    if (d.dev == 0) {
+        std::string why = SDL_GetError();
+        sdl_audio_release();
+        d.set_info("Audio device failed", "The sound device could not be opened: " + why);
+        return false;
+    }
+    d.device_frames = have.samples > 0 ? have.samples : 512;
+    std::string name = "Default output device";
+#if SDL_VERSION_ATLEAST(2, 24, 0)
+    char* dev_name = nullptr;
+    SDL_AudioSpec dspec;
+    if (SDL_GetDefaultAudioInfo(&dev_name, &dspec, 0) == 0 && dev_name) {
+        name = dev_name;
+        SDL_free(dev_name);
+    }
+#endif
+    {
+        std::lock_guard<std::mutex> rl(d.ring_mutex);
+        d.cap = (size_t)(d.rate * kRingSeconds);
+        d.ring.assign(d.cap * 2, 0.0f);
+        d.rd = d.count = 0;
+        // Enough for one callback at the fastest resampling ratio, plus slack.
+        d.scratch.assign(((size_t)d.device_frames * 2 + 16) * 2, 0.0f);
+    }
+    {
+        std::lock_guard<std::mutex> il(d.info_mutex);
+        d.device = name;
+        d.state = "Buffering";
+    }
+    d.net_stop.store(false);
+    d.net = std::thread([&d] { d.network_loop(); });
+    d.active.store(true);
+    SDL_PauseAudioDevice(d.dev, 0);
+    return true;
+}
+
+void AudioPlayer::stop_session()
+{
+    Impl& d = *impl_;
+    std::lock_guard<std::mutex> lock(d.session_mutex);
+    if (!d.active.load() && !d.net.joinable() && d.dev == 0) return;
+    d.net_stop.store(true);
+    if (d.net.joinable()) d.net.join();
+    if (d.dev) {
+        SDL_CloseAudioDevice(d.dev);   // waits for a running callback
+        d.dev = 0;
+        sdl_audio_release();
+    }
+    {
+        std::lock_guard<std::mutex> rl(d.ring_mutex);
+        d.count = d.rd = 0;
+        d.primed = false;
+        d.ring.clear();
+        d.ring.shrink_to_fit();
+    }
+    d.active.store(false);
+    d.streaming.store(false);
+    d.playout.store(-1.0);
+    std::lock_guard<std::mutex> il(d.info_mutex);
+    d.state = "Stopped";
+}
+
+void AudioPlayer::set_auto_floor_ms(int ms)
+{
+    impl_->floor_ms.store(std::clamp(ms, 30, 400));
+    if (!impl_->active.load()) impl_->auto_target_ms.store(std::max(kStartTargetMs, (double)impl_->floor_ms.load()));
+}
+
+double AudioPlayer::playout_ms() const
+{
+    return impl_->active.load() ? impl_->playout.load() : -1.0;
+}
+
+void AudioPlayer::set_sink(Sink sink)
+{
+    std::lock_guard<std::mutex> lock(impl_->sink_mutex);
+    impl_->sink = std::move(sink);
+}
+
+}

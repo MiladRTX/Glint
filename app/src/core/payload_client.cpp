@@ -1,488 +1,560 @@
-﻿#include "glint/payload_client.h"
+#include "glint/payload_client.h"
 
 #include <curl/curl.h>
 
-#include <algorithm>
-#include <cctype>
+#include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
-#include <utility>
 
 namespace glint {
+
+const char* const kTakenOver = "Another viewer has the stream (HTTP 409).";
+
 namespace {
 
-std::once_flag g_curl_once;
+using Clock = std::chrono::steady_clock;
 
-std::string trim(const std::string& value) {
-    size_t first = value.find_first_not_of(" \t\r\n");
-    if (first == std::string::npos) return "";
-    size_t last = value.find_last_not_of(" \t\r\n");
-    return value.substr(first, last - first + 1);
+void curl_setup()
+{
+    static std::once_flag once;
+    std::call_once(once, [] { curl_global_init(CURL_GLOBAL_DEFAULT); });
 }
 
-size_t append_callback(char* data, size_t size, size_t count, void* userdata) {
-    auto* out = static_cast<std::string*>(userdata);
-    out->append(data, size * count);
-    return size * count;
-}
+// --- tiny JSON reader ----------------------------------------------------------
 
-size_t vector_callback(char* data, size_t size, size_t count, void* userdata) {
-    auto* out = static_cast<std::vector<uint8_t>*>(userdata);
-    const uint8_t* begin = reinterpret_cast<const uint8_t*>(data);
-    out->insert(out->end(), begin, begin + size * count);
-    return size * count;
-}
+struct Json {
+    enum Type { Null, Bool, Number, String, Array, Object } type = Null;
+    bool b = false;
+    double num = 0.0;
+    std::string text;   // string value, or the number as written
+    std::vector<Json> items;
+    std::vector<std::pair<std::string, Json>> fields;
 
-uint32_t read_be32(const uint8_t* p) {
-    return (static_cast<uint32_t>(p[0]) << 24) | (static_cast<uint32_t>(p[1]) << 16) |
-           (static_cast<uint32_t>(p[2]) << 8) | static_cast<uint32_t>(p[3]);
-}
-
-struct StreamState {
-    const uint8_t* unused = nullptr;
-    std::vector<uint8_t> pending;
-    bool failed = false;
-    std::string error;
+    const Json* get(const char* key) const
+    {
+        for (const auto& f : fields)
+            if (f.first == key) return &f.second;
+        return nullptr;
+    }
 };
 
-} // namespace
+class JsonParser {
+public:
+    explicit JsonParser(const std::string& s) : s_(s) {}
 
-std::string json_string(const std::string& document, const std::string& key) {
-    std::string needle = "\"" + key + "\"";
-    size_t at = document.find(needle);
-    if (at == std::string::npos) return "";
-    at = document.find(':', at + needle.size());
-    if (at == std::string::npos) return "";
-    at++;
-    while (at < document.size() && std::isspace(static_cast<unsigned char>(document[at]))) at++;
-    if (at >= document.size() || document[at] != '"') return "";
-    at++;
+    bool parse(Json& out)
+    {
+        if (!value(out, 0)) return false;
+        ws();
+        return pos_ == s_.size();
+    }
 
-    std::string value;
-    while (at < document.size()) {
-        char c = document[at++];
-        if (c == '"') break;
-        if (c == '\\' && at < document.size()) {
-            char escaped = document[at++];
-            switch (escaped) {
-            case 'n': value.push_back('\n'); break;
-            case 'r': value.push_back('\r'); break;
-            case 't': value.push_back('\t'); break;
-            case 'b': value.push_back('\b'); break;
-            case 'f': value.push_back('\f'); break;
+private:
+    void ws()
+    {
+        while (pos_ < s_.size() && std::strchr(" \t\r\n", s_[pos_])) pos_++;
+    }
+    bool lit(const char* word)
+    {
+        size_t n = std::strlen(word);
+        if (s_.compare(pos_, n, word) != 0) return false;
+        pos_ += n;
+        return true;
+    }
+    bool string(std::string& out)
+    {
+        if (pos_ >= s_.size() || s_[pos_] != '"') return false;
+        pos_++;
+        out.clear();
+        while (pos_ < s_.size()) {
+            char c = s_[pos_++];
+            if (c == '"') return true;
+            if (c != '\\') {
+                out += c;
+                continue;
+            }
+            if (pos_ >= s_.size()) return false;
+            char e = s_[pos_++];
+            switch (e) {
+            case 'n': out += '\n'; break;
+            case 't': out += '\t'; break;
+            case 'r': out += '\r'; break;
+            case 'b': out += '\b'; break;
+            case 'f': out += '\f'; break;
             case 'u': {
-                if (at + 4 <= document.size()) {
-                    unsigned code = static_cast<unsigned>(
-                        std::strtoul(document.substr(at, 4).c_str(), nullptr, 16));
-                    at += 4;
-                    if (code < 0x80) value.push_back(static_cast<char>(code));
-                    else if (code < 0x800) {
-                        value.push_back(static_cast<char>(0xc0 | (code >> 6)));
-                        value.push_back(static_cast<char>(0x80 | (code & 0x3f)));
-                    } else {
-                        value.push_back(static_cast<char>(0xe0 | (code >> 12)));
-                        value.push_back(static_cast<char>(0x80 | ((code >> 6) & 0x3f)));
-                        value.push_back(static_cast<char>(0x80 | (code & 0x3f)));
-                    }
+                if (pos_ + 4 > s_.size()) return false;
+                unsigned cp = (unsigned)std::strtoul(s_.substr(pos_, 4).c_str(), nullptr, 16);
+                pos_ += 4;
+                if (cp < 0x80) out += (char)cp;
+                else if (cp < 0x800) {
+                    out += (char)(0xC0 | (cp >> 6));
+                    out += (char)(0x80 | (cp & 0x3F));
+                } else {
+                    out += (char)(0xE0 | (cp >> 12));
+                    out += (char)(0x80 | ((cp >> 6) & 0x3F));
+                    out += (char)(0x80 | (cp & 0x3F));
                 }
                 break;
             }
-            default: value.push_back(escaped); break;
+            default: out += e; break;
             }
-        } else {
-            value.push_back(c);
         }
-    }
-    return value;
-}
-
-long long json_int(const std::string& document, const std::string& key, long long fallback) {
-    std::string needle = "\"" + key + "\"";
-    size_t at = document.find(needle);
-    if (at == std::string::npos) return fallback;
-    at = document.find(':', at + needle.size());
-    if (at == std::string::npos) return fallback;
-    at++;
-    while (at < document.size() && std::isspace(static_cast<unsigned char>(document[at]))) at++;
-    char* end = nullptr;
-    long long value = std::strtoll(document.c_str() + at, &end, 10);
-    return end == document.c_str() + at ? fallback : value;
-}
-
-double json_double(const std::string& document, const std::string& key, double fallback) {
-    std::string needle = "\"" + key + "\"";
-    size_t at = document.find(needle);
-    if (at == std::string::npos) return fallback;
-    at = document.find(':', at + needle.size());
-    if (at == std::string::npos) return fallback;
-    at++;
-    while (at < document.size() && std::isspace(static_cast<unsigned char>(document[at]))) at++;
-    char* end = nullptr;
-    double value = std::strtod(document.c_str() + at, &end);
-    return end == document.c_str() + at ? fallback : value;
-}
-
-bool json_bool(const std::string& document, const std::string& key, bool fallback) {
-    std::string needle = "\"" + key + "\"";
-    size_t at = document.find(needle);
-    if (at == std::string::npos) return fallback;
-    at = document.find(':', at + needle.size());
-    if (at == std::string::npos) return fallback;
-    at++;
-    while (at < document.size() && std::isspace(static_cast<unsigned char>(document[at]))) at++;
-    if (document.compare(at, 4, "true") == 0) return true;
-    if (document.compare(at, 5, "false") == 0) return false;
-    return fallback;
-}
-
-std::vector<int> json_int_array(const std::string& document, const std::string& key) {
-    std::vector<int> values;
-    std::string needle = "\"" + key + "\"";
-    size_t at = document.find(needle);
-    if (at == std::string::npos) return values;
-    at = document.find('[', at);
-    if (at == std::string::npos) return values;
-    size_t end = document.find(']', at);
-    if (end == std::string::npos) return values;
-
-    std::string body = document.substr(at + 1, end - at - 1);
-    size_t pos = 0;
-    while (pos < body.size()) {
-        while (pos < body.size() &&
-               !std::isdigit(static_cast<unsigned char>(body[pos])) && body[pos] != '-')
-            pos++;
-        if (pos >= body.size()) break;
-        char* stop = nullptr;
-        long value = std::strtol(body.c_str() + pos, &stop, 10);
-        if (stop == body.c_str() + pos) break;
-        values.push_back(static_cast<int>(value));
-        pos = static_cast<size_t>(stop - body.c_str());
-    }
-    return values;
-}
-
-PayloadClient::PayloadClient(std::string base_url) : base_(std::move(base_url)) {
-    std::call_once(g_curl_once, [] { curl_global_init(CURL_GLOBAL_DEFAULT); });
-    while (!base_.empty() && base_.back() == '/') base_.pop_back();
-}
-
-namespace {
-
-bool perform_get(const std::string& url, size_t (*write)(char*, size_t, size_t, void*),
-                 void* userdata, long timeout_ms, std::string& error) {
-    CURL* curl = curl_easy_init();
-    if (!curl) {
-        error = "curl_easy_init failed";
         return false;
     }
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L);
-    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, timeout_ms);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 5000L);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, userdata);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "Glint/1.0");
-    curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1);
+    bool value(Json& v, int depth)
+    {
+        if (depth > 32) return false;
+        ws();
+        if (pos_ >= s_.size()) return false;
+        char c = s_[pos_];
+        if (c == '{') {
+            v.type = Json::Object;
+            pos_++;
+            ws();
+            if (pos_ < s_.size() && s_[pos_] == '}') return pos_++, true;
+            for (;;) {
+                ws();
+                std::pair<std::string, Json> f;
+                if (!string(f.first)) return false;
+                ws();
+                if (pos_ >= s_.size() || s_[pos_++] != ':') return false;
+                if (!value(f.second, depth + 1)) return false;
+                v.fields.push_back(std::move(f));
+                ws();
+                if (pos_ >= s_.size()) return false;
+                if (s_[pos_] == ',') { pos_++; continue; }
+                if (s_[pos_] == '}') return pos_++, true;
+                return false;
+            }
+        }
+        if (c == '[') {
+            v.type = Json::Array;
+            pos_++;
+            ws();
+            if (pos_ < s_.size() && s_[pos_] == ']') return pos_++, true;
+            for (;;) {
+                Json item;
+                if (!value(item, depth + 1)) return false;
+                v.items.push_back(std::move(item));
+                ws();
+                if (pos_ >= s_.size()) return false;
+                if (s_[pos_] == ',') { pos_++; continue; }
+                if (s_[pos_] == ']') return pos_++, true;
+                return false;
+            }
+        }
+        if (c == '"') {
+            v.type = Json::String;
+            return string(v.text);
+        }
+        if (lit("true")) { v.type = Json::Bool; v.b = true; return true; }
+        if (lit("false")) { v.type = Json::Bool; v.b = false; return true; }
+        if (lit("null")) { v.type = Json::Null; return true; }
+        size_t start = pos_;
+        while (pos_ < s_.size() && std::strchr("+-0123456789.eE", s_[pos_])) pos_++;
+        if (pos_ == start) return false;
+        v.type = Json::Number;
+        v.text = s_.substr(start, pos_ - start);
+        char* end = nullptr;
+        v.num = std::strtod(v.text.c_str(), &end);
+        return end && *end == 0;
+    }
 
-    CURLcode result = curl_easy_perform(curl);
+    const std::string& s_;
+    size_t pos_ = 0;
+};
+
+void take(const Json& o, const char* key, std::string& out)
+{
+    const Json* v = o.get(key);
+    if (v && v->type == Json::String) out = v->text;
+}
+void take(const Json& o, const char* key, int& out)
+{
+    const Json* v = o.get(key);
+    if (v && v->type == Json::Number && std::isfinite(v->num)) out = (int)v->num;
+}
+void take(const Json& o, const char* key, unsigned long long& out)
+{
+    const Json* v = o.get(key);
+    if (!v || v->type != Json::Number) return;
+    if (v->text.find_first_of(".eE-") == std::string::npos) out = std::strtoull(v->text.c_str(), nullptr, 10);
+    else if (std::isfinite(v->num) && v->num >= 0) out = (unsigned long long)v->num;
+}
+void take(const Json& o, const char* key, double& out)
+{
+    const Json* v = o.get(key);
+    if (v && v->type == Json::Number && std::isfinite(v->num)) out = v->num;
+}
+void take(const Json& o, const char* key, bool& out)
+{
+    const Json* v = o.get(key);
+    if (v && v->type == Json::Bool) out = v->b;
+}
+
+// --- one HTTP request through curl's multi interface ----------------------------
+//
+// The multi loop wakes at least every 50 ms, so a stop or cancel flag is seen
+// quickly even when the connection is idle or still connecting.
+
+struct Request {
+    std::string url;
+    bool post = false;
+    long total_timeout_ms = 0;   // 0: none
+    int idle_timeout_ms = 0;     // 0: none
+    const std::atomic_bool* stop = nullptr;
+    const std::atomic_bool* cancel = nullptr;
+    // Body bytes of a 2xx answer; return false to end the transfer early.
+    std::function<bool(const char*, size_t)> on_body;
+};
+
+struct Result {
+    enum Kind { Done, Stopped, CallerEnded, IdleTimeout, HttpError, TransportError } kind = Done;
     long status = 0;
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
-    curl_easy_cleanup(curl);
+    std::string error;   // filled for HttpError / TransportError / IdleTimeout
+};
 
-    if (result != CURLE_OK) {
-        error = curl_easy_strerror(result);
-        return false;
+struct WriteState {
+    CURL* easy = nullptr;
+    const Request* req = nullptr;
+    bool checked = false;
+    bool ok_status = false;
+    bool caller_ended = false;
+    std::string error_body;
+    Clock::time_point last_data;
+};
+
+size_t on_write(char* data, size_t size, size_t count, void* user)
+{
+    WriteState* st = (WriteState*)user;
+    size_t n = size * count;
+    st->last_data = Clock::now();
+    if (!st->checked) {
+        long code = 0;
+        curl_easy_getinfo(st->easy, CURLINFO_RESPONSE_CODE, &code);
+        st->ok_status = code >= 200 && code < 300;
+        st->checked = true;
     }
-    if (status != 200) {
-        error = "HTTP " + std::to_string(status);
-        return false;
+    if (!st->ok_status) {
+        if (st->error_body.size() < 512) st->error_body.append(data, std::min<size_t>(n, 512));
+        return n;
     }
-    return true;
+    if (st->req->on_body && !st->req->on_body(data, n)) {
+        st->caller_ended = true;
+        return 0;   // aborts the transfer
+    }
+    return n;
 }
 
-} // namespace
+std::string describe(CURLcode code, const char* detail)
+{
+    switch (code) {
+    case CURLE_COULDNT_CONNECT: return "the connection was refused or the host can't be reached";
+    case CURLE_OPERATION_TIMEDOUT: return "the request timed out";
+    case CURLE_COULDNT_RESOLVE_HOST: return "the host name could not be found";
+    case CURLE_URL_MALFORMAT: return "the address is not valid";
+    case CURLE_GOT_NOTHING: return "the server closed the connection without an answer";
+    case CURLE_RECV_ERROR:
+    case CURLE_SEND_ERROR: return "the connection was lost";
+    default: break;
+    }
+    if (detail && *detail) return detail;
+    return curl_easy_strerror(code);
+}
 
-bool PayloadClient::fetch_config(StreamConfig& config, std::string& error) {
-    std::string document;
-    if (!perform_get(base_ + "/config.json", append_callback, &document, 5000, error))
-        return false;
+std::string trim_body(std::string body)
+{
+    while (!body.empty() && std::strchr(" \t\r\n", body.back())) body.pop_back();
+    return body;
+}
 
-    config.platform = json_string(document, "platform");
-    config.width = static_cast<int>(json_int(document, "width"));
-    config.height = static_cast<int>(json_int(document, "height"));
-    config.fps = static_cast<int>(json_int(document, "fps"));
-    config.codec = json_string(document, "codec");
-    config.sps = json_string(document, "sps");
-    config.pps = json_string(document, "pps");
-    config.resolutions = json_int_array(document, "resolutions");
-    config.requested_height = static_cast<int>(json_int(document, "requested_height"));
-    config.profile_changing = json_bool(document, "profile_changing");
-    config.profile_error = json_bool(document, "profile_error");
+Result perform(const Request& req)
+{
+    curl_setup();
+    Result result;
+    CURL* easy = curl_easy_init();
+    CURLM* multi = curl_multi_init();
+    if (!easy || !multi) {
+        if (easy) curl_easy_cleanup(easy);
+        if (multi) curl_multi_cleanup(multi);
+        result.kind = Result::TransportError;
+        result.error = "the network library could not start";
+        return result;
+    }
+    char errbuf[CURL_ERROR_SIZE] = {};
+    WriteState st;
+    st.easy = easy;
+    st.req = &req;
+    st.last_data = Clock::now();
 
-    size_t audio = document.find("\"audio\"");
-    config.has_audio = false;
-    if (audio != std::string::npos) {
-        size_t colon = document.find(':', audio);
-        if (colon != std::string::npos) {
-            size_t begin = document.find_first_not_of(" \t\r\n", colon + 1);
-            if (begin != std::string::npos && document[begin] == '{') {
-                int depth = 0;
-                size_t end = begin;
-                bool in_string = false;
-                for (; end < document.size(); end++) {
-                    char c = document[end];
-                    if (in_string) {
-                        if (c == '\\') end++;
-                        else if (c == '"') in_string = false;
-                        continue;
-                    }
-                    if (c == '"') in_string = true;
-                    else if (c == '{') depth++;
-                    else if (c == '}') {
-                        depth--;
-                        if (depth == 0) { end++; break; }
-                    }
-                }
-                std::string block = document.substr(begin, end - begin);
-                config.has_audio = true;
-                config.audio_codec = json_string(block, "codec");
-                config.audio_channels = static_cast<int>(json_int(block, "channels"));
-                config.audio_rate = static_cast<int>(json_int(block, "rate"));
-                config.audio_bits = static_cast<int>(json_int(block, "bits"));
+    curl_easy_setopt(easy, CURLOPT_URL, req.url.c_str());
+    curl_easy_setopt(easy, CURLOPT_NOPROXY, "*");
+    curl_easy_setopt(easy, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(easy, CURLOPT_FOLLOWLOCATION, 0L);
+    curl_easy_setopt(easy, CURLOPT_CONNECTTIMEOUT_MS, 5000L);
+    curl_easy_setopt(easy, CURLOPT_TCP_NODELAY, 1L);
+    curl_easy_setopt(easy, CURLOPT_BUFFERSIZE, 256L * 1024);
+    curl_easy_setopt(easy, CURLOPT_ERRORBUFFER, errbuf);
+    curl_easy_setopt(easy, CURLOPT_WRITEFUNCTION, on_write);
+    curl_easy_setopt(easy, CURLOPT_WRITEDATA, &st);
+    if (req.total_timeout_ms > 0) curl_easy_setopt(easy, CURLOPT_TIMEOUT_MS, req.total_timeout_ms);
+    if (req.post) {
+        curl_easy_setopt(easy, CURLOPT_POST, 1L);
+        curl_easy_setopt(easy, CURLOPT_POSTFIELDS, "");
+        curl_easy_setopt(easy, CURLOPT_POSTFIELDSIZE, 0L);
+    }
+    curl_multi_add_handle(multi, easy);
+
+    bool finished = false;
+    CURLcode code = CURLE_OK;
+    for (;;) {
+        int running = 0;
+        curl_multi_perform(multi, &running);
+        int left = 0;
+        while (CURLMsg* msg = curl_multi_info_read(multi, &left)) {
+            if (msg->msg == CURLMSG_DONE) {
+                finished = true;
+                code = msg->data.result;
             }
         }
-    }
-    return true;
-}
-
-bool PayloadClient::fetch_status(StreamStatus& status, std::string& error) {
-    std::string document;
-    if (!perform_get(base_ + "/status.json", append_callback, &document, 5000, error))
-        return false;
-
-    status.backend = json_string(document, "backend");
-    status.width = static_cast<int>(json_int(document, "width"));
-    status.height = static_cast<int>(json_int(document, "height"));
-    status.frames = static_cast<unsigned long long>(json_int(document, "frames"));
-    status.bytes = static_cast<unsigned long long>(json_int(document, "bytes"));
-    status.fps = json_double(document, "fps");
-    status.kbps = json_double(document, "kbps");
-    status.clients = static_cast<int>(json_int(document, "clients"));
-    status.viewers = static_cast<int>(json_int(document, "viewers"));
-    status.recording = json_bool(document, "recording");
-    status.recording_name = json_string(document, "recording_name");
-    status.recording_frames = static_cast<unsigned long long>(json_int(document, "recording_frames"));
-    status.recording_bytes = static_cast<unsigned long long>(json_int(document, "recording_bytes"));
-    status.recording_seconds = json_double(document, "recording_seconds");
-    status.recording_error = json_bool(document, "recording_error");
-    status.audio_chunks = static_cast<unsigned long long>(json_int(document, "audio_chunks"));
-    status.audio_bytes = static_cast<unsigned long long>(json_int(document, "audio_bytes"));
-    status.audio_kbps = json_double(document, "audio_kbps");
-    status.audio_codec = json_string(document, "audio_codec");
-    return true;
-}
-
-bool PayloadClient::fetch_bytes(const std::string& path, std::vector<uint8_t>& out,
-                                std::string& error, long timeout_ms) {
-    return perform_get(base_ + path, vector_callback, &out, timeout_ms, error);
-}
-
-bool PayloadClient::post(const std::string& path, std::string* body, std::string& error) {
-    CURL* curl = curl_easy_init();
-    if (!curl) {
-        error = "curl_easy_init failed";
-        return false;
-    }
-    std::string response;
-    curl_easy_setopt(curl, CURLOPT_URL, (base_ + path).c_str());
-    curl_easy_setopt(curl, CURLOPT_POST, 1L);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, "");
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, 0L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 8000L);
-    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, append_callback);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "Glint/1.0");
-
-    CURLcode result = curl_easy_perform(curl);
-    long status = 0;
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
-    curl_easy_cleanup(curl);
-
-    if (result != CURLE_OK) {
-        error = curl_easy_strerror(result);
-        return false;
-    }
-    if (status < 200 || status >= 300) {
-        error = "HTTP " + std::to_string(status);
-        if (!response.empty()) error += ": " + response;
-        return false;
-    }
-    if (body) *body = std::move(response);
-    return true;
-}
-
-bool PayloadClient::stream_frames(const FrameCallback& callback, std::atomic_bool& stop,
-                                  std::string& error, int idle_timeout_ms) {
-    StreamState state;
-
-    /* The parsing loop needs the callback, so it lives outside the plain C
-     * callback thunk above. */
-    struct Context {
-        const FrameCallback* callback;
-        StreamState* state;
-        std::atomic_bool* stop;
-    } context{&callback, &state, &stop};
-
-    auto thunk = [](char* data, size_t size, size_t count, void* userdata) -> size_t {
-        auto* ctx = static_cast<Context*>(userdata);
-        size_t total = size * count;
-        const uint8_t* bytes = reinterpret_cast<const uint8_t*>(data);
-        ctx->state->pending.insert(ctx->state->pending.end(), bytes, bytes + total);
-
-        size_t offset = 0;
-        while (ctx->state->pending.size() - offset >= 8) {
-            if (ctx->stop->load()) return 0;
-            uint32_t frame_size = read_be32(ctx->state->pending.data() + offset);
-            uint32_t pts = read_be32(ctx->state->pending.data() + offset + 4);
-            if (frame_size == 0 || frame_size > 2u * 1024u * 1024u) {
-                ctx->state->failed = true;
-                ctx->state->error = "invalid frame size";
-                return 0;
-            }
-            if (ctx->state->pending.size() - offset < 8u + frame_size) break;
-            const uint8_t* frame = ctx->state->pending.data() + offset + 8;
-            if (!(*ctx->callback)(frame, frame_size, pts)) return 0;
-            offset += 8u + frame_size;
+        if (finished || running == 0) break;
+        if ((req.stop && req.stop->load()) || (req.cancel && req.cancel->load())) {
+            result.kind = Result::Stopped;
+            break;
         }
-        if (offset) ctx->state->pending.erase(ctx->state->pending.begin(),
-                                              ctx->state->pending.begin() + offset);
-        return total;
-    };
-
-    // Without this a stalled stream only notices `stop` after the idle timeout.
-    auto progress = [](void* userdata, curl_off_t, curl_off_t, curl_off_t, curl_off_t) -> int {
-        return static_cast<Context*>(userdata)->stop->load() ? 1 : 0;
-    };
-
-    CURL* curl = curl_easy_init();
-    if (!curl) {
-        error = "curl_easy_init failed";
-        return false;
-    }
-    // One viewer at a time: the app only connects when asked to, so it takes
-    // the stream from whoever has it (docs/API.md).
-    curl_easy_setopt(curl, CURLOPT_URL, (base_ + "/frames?take=1").c_str());
-    curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
-    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
-    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, +progress);
-    curl_easy_setopt(curl, CURLOPT_XFERINFODATA, &context);
-    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 5000L);
-    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
-    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, (long)(idle_timeout_ms / 1000));
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, +thunk);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &context);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "Glint/1.0");
-
-    CURLcode result = curl_easy_perform(curl);
-    long http_status = 0;
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_status);
-    curl_easy_cleanup(curl);
-
-    if (result == CURLE_HTTP_RETURNED_ERROR && http_status == 409) {
-        error = kTakenOver;
-        return false;
-    }
-    if (state.failed) {
-        error = state.error;
-        return false;
-    }
-    if (result != CURLE_OK && !stop.load()) {
-        error = curl_easy_strerror(result);
-        return false;
-    }
-    return true;
-}
-
-bool PayloadClient::stream_audio(const AudioCallback& callback, std::atomic_bool& stop,
-                                 std::string& error, int idle_timeout_ms) {
-    StreamState state;
-    struct Context {
-        const AudioCallback* callback;
-        StreamState* state;
-        std::atomic_bool* stop;
-    } context{&callback, &state, &stop};
-
-    auto thunk = [](char* data, size_t size, size_t count, void* userdata) -> size_t {
-        auto* ctx = static_cast<Context*>(userdata);
-        size_t total = size * count;
-        const uint8_t* bytes = reinterpret_cast<const uint8_t*>(data);
-        ctx->state->pending.insert(ctx->state->pending.end(), bytes, bytes + total);
-
-        size_t offset = 0;
-        while (ctx->state->pending.size() - offset >= 8) {
-            if (ctx->stop->load()) return 0;
-            uint32_t packet_size = read_be32(ctx->state->pending.data() + offset);
-            uint32_t pts = read_be32(ctx->state->pending.data() + offset + 4);
-            if (packet_size == 0 || packet_size > 65536u) {
-                ctx->state->failed = true;
-                ctx->state->error = "invalid audio packet";
-                return 0;
-            }
-            if (ctx->state->pending.size() - offset < 8u + packet_size) break;
-            const uint8_t* packet = ctx->state->pending.data() + offset + 8;
-            if (!(*ctx->callback)(packet, packet_size, pts)) return 0;
-            offset += 8u + packet_size;
+        if (req.idle_timeout_ms > 0 &&
+            Clock::now() - st.last_data > std::chrono::milliseconds(req.idle_timeout_ms)) {
+            result.kind = Result::IdleTimeout;
+            result.error = "no data arrived for " + std::to_string((req.idle_timeout_ms + 500) / 1000) + " s";
+            break;
         }
-        if (offset) ctx->state->pending.erase(ctx->state->pending.begin(),
-                                              ctx->state->pending.begin() + offset);
-        return total;
+        curl_multi_poll(multi, nullptr, 0, 50, nullptr);
+    }
+
+    curl_easy_getinfo(easy, CURLINFO_RESPONSE_CODE, &result.status);
+    if (finished) {
+        if (st.caller_ended) {
+            result.kind = Result::CallerEnded;
+        } else if (code != CURLE_OK) {
+            result.kind = Result::TransportError;
+            result.error = describe(code, errbuf);
+        } else if (result.status < 200 || result.status >= 300) {
+            result.kind = Result::HttpError;
+            std::string body = trim_body(st.error_body);
+            result.error = "HTTP " + std::to_string(result.status) + (body.empty() ? "" : ": " + body);
+        }
+    }
+    curl_multi_remove_handle(multi, easy);
+    curl_easy_cleanup(easy);
+    curl_multi_cleanup(multi);
+    return result;
+}
+
+std::string normalize_base(std::string base)
+{
+    while (!base.empty() && std::strchr(" \t\r\n", base.back())) base.pop_back();
+    size_t start = base.find_first_not_of(" \t\r\n");
+    base = start == std::string::npos ? std::string() : base.substr(start);
+    while (!base.empty() && base.back() == '/') base.pop_back();
+    if (!base.empty() && base.find("://") == std::string::npos) base = "http://" + base;
+    return base;
+}
+
+}  // namespace
+
+PayloadClient::PayloadClient(std::string base_url) : base_(normalize_base(std::move(base_url))) {}
+
+bool PayloadClient::fetch_json(const std::string& path, std::string& body, std::string& error)
+{
+    Request req;
+    req.url = base_ + path;
+    req.total_timeout_ms = 5000;
+    req.cancel = cancel_;
+    body.clear();
+    req.on_body = [&](const char* d, size_t n) {
+        if (body.size() > (1u << 20)) return false;
+        body.append(d, n);
+        return true;
     };
-
-    auto progress = [](void* userdata, curl_off_t, curl_off_t, curl_off_t, curl_off_t) -> int {
-        return static_cast<Context*>(userdata)->stop->load() ? 1 : 0;
-    };
-
-    CURL* curl = curl_easy_init();
-    if (!curl) {
-        error = "curl_easy_init failed";
+    Result r = perform(req);
+    if (r.kind == Result::Stopped) {
+        error = "cancelled";
         return false;
     }
-    curl_easy_setopt(curl, CURLOPT_URL, (base_ + "/audio").c_str());   // never takes: it reconnects on its own
-    curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
-    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
-    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, +progress);
-    curl_easy_setopt(curl, CURLOPT_XFERINFODATA, &context);
-    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 5000L);
-    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
-    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, (long)(idle_timeout_ms / 1000));
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, +thunk);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &context);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "Glint/1.0");
-
-    CURLcode result = curl_easy_perform(curl);
-    long http_status = 0;
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_status);
-    curl_easy_cleanup(curl);
-
-    if (result == CURLE_HTTP_RETURNED_ERROR && http_status == 409) {
-        error = kTakenOver;
+    if (r.kind == Result::CallerEnded) {
+        error = "the answer is too large";
         return false;
     }
-    if (state.failed) {
-        error = state.error;
-        return false;
-    }
-    if (result != CURLE_OK && !stop.load()) {
-        error = curl_easy_strerror(result);
+    if (r.kind != Result::Done) {
+        error = r.error;
         return false;
     }
     return true;
 }
 
-} // namespace glint
+bool PayloadClient::fetch_config(StreamConfig& config, std::string& error)
+{
+    std::string body;
+    if (!fetch_json("/config.json", body, error)) return false;
+    Json j;
+    if (!JsonParser(body).parse(j) || j.type != Json::Object) {
+        error = "the console sent a config that could not be read";
+        return false;
+    }
+    StreamConfig c;
+    take(j, "platform", c.platform);
+    take(j, "width", c.width);
+    take(j, "height", c.height);
+    take(j, "fps", c.fps);
+    take(j, "codec", c.codec);
+    take(j, "sps", c.sps);
+    take(j, "pps", c.pps);
+    const Json* audio = j.get("audio");
+    if (audio && audio->type == Json::Object) {
+        c.has_audio = true;
+        take(*audio, "codec", c.audio_codec);
+        take(*audio, "channels", c.audio_channels);
+        take(*audio, "rate", c.audio_rate);
+        take(*audio, "bits", c.audio_bits);
+    }
+    const Json* res = j.get("resolutions");
+    if (res && res->type == Json::Array)
+        for (const Json& item : res->items)
+            if (item.type == Json::Number) c.resolutions.push_back((int)item.num);
+    take(j, "requested_height", c.requested_height);
+    take(j, "profile_changing", c.profile_changing);
+    take(j, "profile_error", c.profile_error);
+    config = c;
+    return true;
+}
 
+bool PayloadClient::fetch_status(StreamStatus& status, std::string& error)
+{
+    std::string body;
+    if (!fetch_json("/status.json", body, error)) return false;
+    Json j;
+    if (!JsonParser(body).parse(j) || j.type != Json::Object) {
+        error = "the console sent a status that could not be read";
+        return false;
+    }
+    StreamStatus s;
+    take(j, "backend", s.backend);
+    take(j, "width", s.width);
+    take(j, "height", s.height);
+    take(j, "frames", s.frames);
+    take(j, "bytes", s.bytes);
+    take(j, "fps", s.fps);
+    take(j, "kbps", s.kbps);
+    take(j, "clients", s.clients);
+    take(j, "viewers", s.viewers);
+    take(j, "recording", s.recording);
+    take(j, "recording_name", s.recording_name);
+    take(j, "recording_frames", s.recording_frames);
+    take(j, "recording_bytes", s.recording_bytes);
+    take(j, "recording_seconds", s.recording_seconds);
+    take(j, "recording_error", s.recording_error);
+    take(j, "audio_chunks", s.audio_chunks);
+    take(j, "audio_bytes", s.audio_bytes);
+    take(j, "audio_kbps", s.audio_kbps);
+    take(j, "audio_codec", s.audio_codec);
+    status = s;
+    return true;
+}
+
+bool PayloadClient::post(const std::string& path, std::string* body, std::string& error)
+{
+    Request req;
+    req.url = base_ + path;
+    req.post = true;
+    req.total_timeout_ms = 8000;
+    req.cancel = cancel_;
+    std::string text;
+    req.on_body = [&](const char* d, size_t n) {
+        if (text.size() < (1u << 20)) text.append(d, n);
+        return true;
+    };
+    Result r = perform(req);
+    if (r.kind == Result::Stopped) {
+        error = "cancelled";
+        return false;
+    }
+    if (r.kind != Result::Done) {
+        error = r.error;
+        return false;
+    }
+    if (body) *body = text;
+    return true;
+}
+
+bool PayloadClient::stream_records(const std::string& path, size_t max_len,
+                                   const std::function<bool(const uint8_t*, size_t, uint32_t)>& callback,
+                                   std::atomic_bool& stop, std::string& error, int idle_timeout_ms)
+{
+    error.clear();
+    std::vector<uint8_t> buf;
+    size_t head = 0;   // start of unparsed bytes in buf
+    bool bad_framing = false;
+
+    Request req;
+    req.url = base_ + path;
+    req.idle_timeout_ms = idle_timeout_ms > 0 ? idle_timeout_ms : 0;
+    req.stop = &stop;
+    req.cancel = cancel_;
+    req.on_body = [&](const char* d, size_t n) {
+        buf.insert(buf.end(), (const uint8_t*)d, (const uint8_t*)d + n);
+        for (;;) {
+            size_t avail = buf.size() - head;
+            if (avail < 8) break;
+            const uint8_t* p = buf.data() + head;
+            size_t len = ((size_t)p[0] << 24) | ((size_t)p[1] << 16) | ((size_t)p[2] << 8) | p[3];
+            uint32_t pts = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) | ((uint32_t)p[6] << 8) | p[7];
+            if (len == 0 || len > max_len) {
+                bad_framing = true;
+                return false;
+            }
+            if (avail < 8 + len) break;
+            if (!callback(p + 8, len, pts)) return false;
+            if (stop.load()) return false;
+            head += 8 + len;
+        }
+        if (head > 0 && (head == buf.size() || head > (1u << 20))) {
+            buf.erase(buf.begin(), buf.begin() + (ptrdiff_t)head);
+            head = 0;
+        }
+        return true;
+    };
+
+    Result r = perform(req);
+    if (bad_framing) {
+        error = "the stream has invalid framing";
+        return false;
+    }
+    switch (r.kind) {
+    case Result::Done:
+    case Result::Stopped:
+    case Result::CallerEnded:
+        return true;
+    case Result::HttpError:
+        error = r.status == 409 ? std::string(kTakenOver) : r.error;
+        return false;
+    default:
+        error = r.error;
+        return false;
+    }
+}
+
+bool PayloadClient::stream_frames(const FrameCallback& callback, std::atomic_bool& stop, std::string& error,
+                                  int idle_timeout_ms)
+{
+    return stream_records("/frames?take=1", 2097152, callback, stop, error, idle_timeout_ms);
+}
+
+bool PayloadClient::stream_audio(const AudioCallback& callback, std::atomic_bool& stop, std::string& error,
+                                 int idle_timeout_ms)
+{
+    return stream_records("/audio", 65536, callback, stop, error, idle_timeout_ms);
+}
+
+}

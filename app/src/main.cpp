@@ -239,12 +239,11 @@ static void SetupVulkanWindow(ImGui_ImplVulkanH_Window* wd, VkSurfaceKHR surface
     wd->SurfaceFormat = ImGui_ImplVulkanH_SelectSurfaceFormat(g_PhysicalDevice, wd->Surface, requestSurfaceImageFormat, (size_t)IM_ARRAYSIZE(requestSurfaceImageFormat), requestSurfaceColorSpace);
 
     // Select Present Mode
-#ifdef APP_USE_UNLIMITED_FRAME_RATE
-    VkPresentModeKHR present_modes[] = { VK_PRESENT_MODE_MAILBOX_KHR, VK_PRESENT_MODE_IMMEDIATE_KHR, VK_PRESENT_MODE_FIFO_KHR };
-#else
-    VkPresentModeKHR present_modes[] = { VK_PRESENT_MODE_FIFO_KHR };
-#endif
+    // Mailbox shows a new picture at the next refresh without queueing behind older
+    // ones (no tearing); FIFO when the driver doesn't offer it.
+    VkPresentModeKHR present_modes[] = { VK_PRESENT_MODE_MAILBOX_KHR, VK_PRESENT_MODE_FIFO_KHR };
     wd->PresentMode = ImGui_ImplVulkanH_SelectPresentMode(g_PhysicalDevice, wd->Surface, &present_modes[0], IM_ARRAYSIZE(present_modes));
+    if (wd->PresentMode == VK_PRESENT_MODE_MAILBOX_KHR) g_MinImageCount = 3;   // one shown, one waiting, one being drawn
     //printf("[vulkan] Selected PresentMode = %d\n", wd->PresentMode);
 
     // Create SwapChain, RenderPass, Framebuffer, etc.
@@ -365,9 +364,6 @@ static void FramePresent(ImGui_ImplVulkanH_Window* wd)
 #include "app.h"
 #include "decoder.h"
 #include "player.h"
-#include "destinations.h"
-#include "tls_relay.h"
-#include "oauth.h"
 #include "log.h"
 #include "settings.h"
 #include "glint/version.h"
@@ -1557,16 +1553,6 @@ static void present_picture(VideoTexture& tex, const glint::Picture& pic, glint:
 // only for frames that arrived late. Dark is the default theme.
 // ---------------------------------------------------------------------------
 
-// Live streaming to Twitch / YouTube / TikTok / custom RTMP is switched OFF in
-// this build: the Streaming settings tab, Go live in the command bar, the live
-// badge, account sign-in and the --broadcast-test / --golive-test /
-// --oauth-test / --tls-probe / --store-test modes are compiled out. The engine stays in the
-// source (src/stream/: broadcast, destinations, oauth, tls_relay; App's
-// start_broadcast) so it can come back by building with -DSL_LIVE_STREAMING=1.
-#ifndef SL_LIVE_STREAMING
-#define SL_LIVE_STREAMING 0
-#endif
-
 static GLFWwindow* g_window = nullptr;
 
 static inline ImVec2 operator+(const ImVec2& a, const ImVec2& b) { return ImVec2(a.x + b.x, a.y + b.y); }
@@ -1669,13 +1655,13 @@ static void set_theme(int theme, bool instant = false)
 }
 
 struct Fonts {
-    ImFont* body = nullptr;      // Geist 15
-    ImFont* small = nullptr;     // Geist 13.5: descriptions, notes
-    ImFont* label = nullptr;     // Geist Medium 13.5: tabs, segments, section headings, badges
-    ImFont* strong = nullptr;    // Geist Medium 15: row titles, button labels
-    ImFont* title = nullptr;     // Geist SemiBold 20
-    ImFont* display = nullptr;   // Geist SemiBold 30
-    ImFont* mono = nullptr;      // Geist Mono 13: only numbers that change while you watch
+    ImFont* body = nullptr;      // Inter 15
+    ImFont* small = nullptr;     // Inter 13.5: descriptions, notes
+    ImFont* label = nullptr;     // Inter Medium 13.5: tabs, segments, section headings, badges
+    ImFont* strong = nullptr;    // Inter Medium 15: row titles, button labels
+    ImFont* title = nullptr;     // Space Grotesk SemiBold 20
+    ImFont* display = nullptr;   // Space Grotesk SemiBold 30
+    ImFont* mono = nullptr;      // JetBrains Mono 13: only numbers that change while you watch
     bool icons = false;
 };
 static Fonts F;
@@ -1764,6 +1750,11 @@ static void step_towards(float& t, bool open, float seconds)
     t = open ? std::min(1.0f, t + step) : std::max(0.0f, t - step);
 }
 
+// Set while a scroll is gliding: the main loop then draws at the display's
+// refresh instead of its idle 60 Hz, so the glide doesn't judder on a fast
+// monitor.
+static bool g_ui_animating = false;
+
 // Eased wheel scrolling for the current child window. Begin the child with
 // NoScrollbar | NoScrollWithMouse: the wheel moves a target and the view glides
 // to it. `reset` jumps back to the top (a new page).
@@ -1777,8 +1768,10 @@ static void smooth_scroll(bool reset = false)
         target -= io.MouseWheel * px(110);
     target = std::clamp(target, 0.0f, ImGui::GetScrollMaxY());
     float y = reset ? 0.0f : ImGui::GetScrollY();
-    y += (target - y) * std::min(1.0f, io.DeltaTime * 14.0f);
+    // Exponential approach, the same feel at any frame rate (~70 ms to cover 63 %).
+    y += (target - y) * (1.0f - std::exp(-io.DeltaTime * 14.0f));
     if (std::fabs(target - y) < 0.5f) y = target;
+    else g_ui_animating = true;
     ImGui::SetScrollY(y);
     st->SetFloat(id, target);
 }
@@ -1791,7 +1784,7 @@ static bool file_exists(const char* path)
     return true;
 }
 
-#include "fonts.inc"   // Geist, embedded (tools/embed_fonts.js)
+#include "fonts.inc"   // Inter, Space Grotesk, JetBrains Mono, embedded (tools/embed_fonts.js)
 
 static void load_fonts(float scale)
 {
@@ -1818,13 +1811,13 @@ static void load_fonts(float scale)
         }
         return font;
     };
-    F.body = add(kGeistRegular, sizeof(kGeistRegular), 15.0f);   // first font = default
-    F.small = add(kGeistRegular, sizeof(kGeistRegular), 13.5f);
-    F.label = add(kGeistMedium, sizeof(kGeistMedium), 13.5f);
-    F.strong = add(kGeistMedium, sizeof(kGeistMedium), 15.0f);
-    F.title = add(kGeistSemiBold, sizeof(kGeistSemiBold), 20.0f);
-    F.display = add(kGeistSemiBold, sizeof(kGeistSemiBold), 30.0f);
-    F.mono = add(kGeistMonoRegular, sizeof(kGeistMonoRegular), 13.0f);
+    F.body = add(kInterRegular, sizeof(kInterRegular), 15.0f);   // first font = default
+    F.small = add(kInterRegular, sizeof(kInterRegular), 13.5f);
+    F.label = add(kInterMedium, sizeof(kInterMedium), 13.5f);
+    F.strong = add(kInterMedium, sizeof(kInterMedium), 15.0f);
+    F.title = add(kSpaceGroteskSemiBold, sizeof(kSpaceGroteskSemiBold), 20.0f);
+    F.display = add(kSpaceGroteskSemiBold, sizeof(kSpaceGroteskSemiBold), 30.0f);
+    F.mono = add(kJetBrainsMonoRegular, sizeof(kJetBrainsMonoRegular), 13.0f);
 }
 
 // ImGui's own widgets (text fields, scrollbars, tooltips) follow the palette.
@@ -2082,7 +2075,7 @@ static bool segmented(const char* id, int* current, const char* const* items, in
 static bool slider(const char* id, float* value, float vmin, float vmax, const char* fmt,
                    float display_scale, float width, bool enabled = true)
 {
-    float label_w = px(46);   // fits "400%" in Geist Mono 13
+    float label_w = px(46);   // fits "400%" in JetBrains Mono 13
     float track_w = std::max(px(60), width - label_w);
     float h = px(26);
     ImVec2 p = ImGui::GetCursorScreenPos();
@@ -2495,7 +2488,7 @@ static void do_screenshot(glint::App& app)
         gallery_status("Saved screenshot " + base_name(path), false);
         g_gallery.loaded = false;
     } else {
-        gallery_status(error.empty() ? "Screenshot could not be saved." : error, true);
+        gallery_status(error.empty() ? "Couldn't save the screenshot." : error, true);
     }
 }
 
@@ -3007,11 +3000,7 @@ static bool watched_elsewhere(glint::App& app)
 }
 
 // Settings tabs. The gallery is its own overlay (draw_gallery).
-#if SL_LIVE_STREAMING
-enum Page { PageConsole, PageVideo, PagePicture, PageAudio, PageCapture, PageStreaming, PageHelp, PageCount };
-#else
 enum Page { PageConsole, PageVideo, PagePicture, PageAudio, PageCapture, PageHelp, PageCount };
-#endif
 
 struct Shell {
     bool settings_open = false;
@@ -3237,9 +3226,9 @@ static void page_console(glint::App& app)
         row_end();
 
         bool confirming = ImGui::GetTime() < g_shell.stop_confirm_until;
-        const char* label = confirming ? "Click again to stop" : "Stop capture";
+        const char* label = confirming ? "Click again to stop" : "End capture";
         float sw = button_width(icon::power, label);
-        row_begin("Stop capture on the console",
+        row_begin("End the console's capture",
                   "Ends capture on the console and disconnects everyone watching. On some consoles this crashes the "
                   "system, so restart the PS5 before starting the payload again.",
                   sw);
@@ -3290,7 +3279,7 @@ static std::string conversion_in_use(glint::App& app)
 // ---------------------------------------------------------------------------
 // Settings -> Picture: the enhancement passes (g_enh). A profile picks a set of
 // values; touching any control switches to Custom with the values shown. With
-// "Protect frame time" the profile steps down while the passes take longer
+// "Guard frame pacing" the profile steps down while the passes take longer
 // than the GPU budget (measured each frame), so a weak GPU never drops frames.
 // ---------------------------------------------------------------------------
 
@@ -3302,7 +3291,7 @@ constexpr int kUpscalerCount = 4;
 static glint::PictureSettings g_picture;
 static std::vector<glint::PicturePreset> g_picture_presets;   // the user's own, saved in picture.conf
 static std::string g_picture_active;   // the user preset applied (Custom started from it), "" for a built-in profile
-static int g_picture_step = 0;              // profiles stepped down by "Protect frame time"
+static int g_picture_step = 0;              // profiles stepped down by "Guard frame pacing"
 static int g_picture_step_profile = -1;     // the profile the step belongs to
 static double g_picture_over_since = -1.0;
 
@@ -3474,7 +3463,7 @@ static void picture_tweak(int which, glint::PictureSettings& v, float width)
     }
 }
 static const char* const kTweakNames[TweakCount] = {"Upscaler", "Sharpness",  "Denoise",    "Debanding",
-                                                    "Dithering", "Exposure", "Saturation", "Shadow detail"};
+                                                    "Dithering", "Exposure", "Saturation", "Shadow lift"};
 
 // Commits edited values (if any) as Custom.
 static void picture_commit(const glint::PictureSettings& v, const glint::PictureSettings& before)
@@ -3486,6 +3475,8 @@ static void page_picture(glint::App& app)
 {
     using namespace ui;
     (void)app;
+    page_header("Picture", "Upscaling, sharpening and clean-up for the live picture, on your graphics card.");
+
     section("Profile");
     card_begin();
     {
@@ -3499,7 +3490,7 @@ static void page_picture(glint::App& app)
             std::snprintf(status, sizeof(status), "Off");
         else if (!g_enh.shown)
             std::snprintf(status, sizeof(status), g_enh.tried && !g_enh.available ? "Not available on this GPU"
-                                                                                  : "Waiting for video");
+                                                                                  : "Waiting for the picture");
         else {
             const char* up = g_enh.used_upscaler >= 0 ? kUpscalers[g_enh.used_upscaler] : "no upscaling";
             if (g_enh.timestamp_ns > 0)
@@ -3646,7 +3637,7 @@ static void page_picture(glint::App& app)
         "Lifts dark areas, leaves the rest.",
     };
     static const char* const up_hints[] = {
-        "Smooth and cheapest.", "Sharper edges, no halos.", "AMD FidelityFX FSR 1: edge-adaptive, clean lines.",
+        "Softest, and lightest on the GPU.", "Sharper edges, no halos.", "AMD FidelityFX FSR 1: edge-adaptive, clean lines.",
         "FSRCNNX neural network: rebuilds fine detail. Used from 1.3x, else Lanczos."};
     auto tweak_row = [&](int which) {
         float w = which == TweakUpscaler ? segmented_width(kUpscalers, kUpscalerCount, px(72)) : sw;
@@ -3655,14 +3646,14 @@ static void page_picture(glint::App& app)
         row_end();
     };
 
-    section("Upscaling and sharpening");
+    section("Scaling and sharpness");
     card_begin();
     tweak_row(TweakUpscaler);
     tweak_row(TweakSharpness);
     card_note(C.muted, "Upscaling applies when the picture is shown larger than the stream (1080p).");
     card_end();
 
-    section("Compression cleanup");
+    section("Artifact reduction");
     card_begin();
     tweak_row(TweakDenoise);
     tweak_row(TweakDeband);
@@ -3682,15 +3673,15 @@ static void page_picture(glint::App& app)
     section("Frame time");
     card_begin();
     {
-        row_begin("Protect frame time", "Steps the profile down when the passes take longer than the budget.", px(40),
+        row_begin("Guard frame pacing", "Steps the profile down when the passes take longer than the budget.", px(40),
                   22);
         toggle("##pprotect", &g_picture.protect);
         row_end();
-        row_begin("GPU budget", "Time the passes may take per frame.", sw);
+        row_begin("GPU time limit", "Time the passes may take per frame.", sw);
         slider("##pbudget", &g_picture.budget_ms, 0.5f, 10.0f, "%.1f ms", 1.0f, sw, g_picture.protect);
         row_end();
         float bw = button_width(icon::refresh, "Reset");
-        row_begin("Profile defaults", "Back to Balanced with neutral colour.", bw, 36);
+        row_begin("Reset to profile", "Back to Balanced with neutral colour.", bw, 36);
         if (button("##preset", icon::refresh, "Reset", Kind::Secondary, ImVec2(bw, 0))) {
             glint::PictureSettings d;
             d.protect = g_picture.protect;
@@ -3812,7 +3803,7 @@ static void page_video(glint::App& app)
     {
         static const char* modes[] = {"Fit window", "Fill window", "No upscaling"};
         int mode = g_shell.picture;
-        row_begin("Picture size",
+        row_begin("Picture fit",
                   "Fit shows the whole picture, Fill crops it to cover the window, No upscaling keeps the picture's "
                   "own pixels.  (P)",
                   segmented_width(modes, 3, px(96)));
@@ -3843,7 +3834,7 @@ static void page_video(glint::App& app)
     }
     card_end();
 
-    section("Stream from the console");
+    section("Console stream");
     card_begin();
     {
         // 1080p only: this console refuses 1440p and cannot do 2160p, so there is
@@ -3868,7 +3859,7 @@ static void page_video(glint::App& app)
     {
         static const char* where[] = {"GPU", "CPU"};
         int dec = app.gpu_decode() ? 0 : 1;
-        row_begin("Video decoder", "The GPU is lighter on the processor. Use the CPU if the picture glitches.",
+        row_begin("Video decoder", "GPU decoding saves CPU time. Switch to CPU if you see glitches.",
                   segmented_width(where, 2, px(64)));
         if (segmented("##dec", &dec, where, 2, px(64))) {
             app.set_gpu_decode(dec == 0);
@@ -3901,13 +3892,13 @@ static void page_video(glint::App& app)
                       driver_version_text(props).c_str());
         value_row("Driver", drv);
         std::string in_use = app.decoder_description();
-        value_row("Decoder in use", in_use.empty() ? std::string("Not decoding") : in_use);
+        value_row("Active decoder", in_use.empty() ? std::string("Not decoding") : in_use);
         value_row("Color conversion in use", conversion_in_use(app));
         std::string codec = config.codec.empty() ? "Unknown until connected" : config.codec;
         value_row("Stream codec", codec);
         const char* page = driver_page(props.vendorID);
         float ow = button_width(icon::share, "Open");
-        row_begin("Driver support", "The graphics vendor's driver page.", ow);
+        row_begin("Drivers", "Download page for your graphics driver.", ow);
         if (button("##driver", icon::share, "Open", Kind::Secondary, ImVec2(ow, 0), page != nullptr))
             glint::open_with_default_app(page);
         row_end();
@@ -3926,7 +3917,7 @@ static void page_audio(glint::App& app)
     card_begin();
     {
         bool on = audio.enabled();
-        row_begin("Console sound", "Play the console's audio here.  (M)", px(40), 22);
+        row_begin("Game audio", "Play the console's audio here.  (M)", px(40), 22);
         if (toggle("##sound", &on)) audio.set_enabled(on);
         row_end();
         float vol = audio.volume();
@@ -4032,7 +4023,7 @@ static void page_capture(glint::App& app)
     }
     card_end();
 
-    section("Record on this PC");
+    section("PC recording");
     card_begin();
     {
         static char dir[512];
@@ -4087,7 +4078,7 @@ static void page_capture(glint::App& app)
     }
     card_end();
 
-    section("Record on the console");
+    section("Console-side recording");
     card_begin();
     {
         const char* action = status.recording ? "Stop" : "Start";
@@ -4106,7 +4097,7 @@ static void page_capture(glint::App& app)
                 ui::toast("Console recording request failed: " + error, 2);
         }
         row_end();
-        if (status.recording_error) card_note(C.danger, "The console reported a recording error.");
+        if (status.recording_error) card_note(C.danger, "Recording on the console failed.");
     }
     card_end();
 }
@@ -4238,7 +4229,7 @@ static void draw_gallery(glint::App& app)
         ImVec2 avail = ImGui::GetContentRegionAvail();
         ImGui::SetCursorPos(ImVec2(ImGui::GetCursorPosX(), ImGui::GetCursorPosY() + avail.y * 0.35f));
         ImGui::PushFont(F.title);
-        const char* t = "Nothing here yet";
+        const char* t = "No captures yet";
         ImGui::SetCursorPosX((ImGui::GetWindowWidth() - ImGui::CalcTextSize(t).x) * 0.5f);
         ImGui::TextUnformatted(t);
         ImGui::PopFont();
@@ -4395,536 +4386,6 @@ static void draw_gallery(glint::App& app)
     ImGui::EndPopup();
 }
 
-#if SL_LIVE_STREAMING   // live streaming UI: off in this build (see SL_LIVE_STREAMING above)
-// ---------------------------------------------------------------------------
-// Live streaming state
-// ---------------------------------------------------------------------------
-
-struct StreamUi {
-    glint::DestinationStore store;
-    bool loaded = false;
-    std::map<std::string, bool> has_key;     // vault lookups cached per destination
-    std::string editing;                     // destination id being edited
-    bool editing_new = false;
-    char name[128] = {};
-    char server[512] = {};
-    char key[512] = {};
-    std::string pending_remove;
-    double pending_remove_until = 0;
-    double golive_confirm_until = 0;
-    // Account sign-in
-    glint::AccountLinker linker;
-    char twitch_id[128] = {};
-    char youtube_id[256] = {};
-    char youtube_secret[256] = {};
-    bool youtube_has_secret = false;
-};
-static StreamUi g_stream;
-
-static void stream_load()
-{
-    if (g_stream.loaded) return;
-    std::string error;
-    if (!g_stream.store.load(error)) ui::toast(error, 2);
-    g_stream.has_key.clear();
-    for (const auto& d : g_stream.store.items()) g_stream.has_key[d.id] = g_stream.store.has_key(d.id);
-    glint::OAuthApps apps;
-    if (glint::load_oauth_apps(apps, error)) {
-        std::snprintf(g_stream.twitch_id, sizeof(g_stream.twitch_id), "%s", apps.twitch_client_id.c_str());
-        std::snprintf(g_stream.youtube_id, sizeof(g_stream.youtube_id), "%s", apps.youtube_client_id.c_str());
-    } else {
-        ui::toast(error, 2);
-    }
-    std::string secret;
-    g_stream.youtube_has_secret = glint::vault::read(glint::vault::target("OAuth", "youtube-client-secret"), secret);
-    g_stream.loaded = true;
-}
-
-static void stream_save()
-{
-    std::string error;
-    if (!g_stream.store.save(error)) ui::toast(error.empty() ? "Cannot save stream destinations" : error, 2);
-}
-
-static int enabled_destinations()
-{
-    int n = 0;
-    for (const auto& d : g_stream.store.items()) n += d.enabled ? 1 : 0;
-    return n;
-}
-
-// Turned-on destinations with their keys, as the broadcaster wants them.
-static bool build_targets(const glint::DestinationStore& store, std::vector<glint::BroadcastTarget>& targets,
-                          glint::BroadcastQuality& q, std::string& error)
-{
-    targets.clear();
-    for (const auto& d : store.items()) {
-        if (!d.enabled) continue;
-        std::string key = store.key(d.id);
-        if (key.empty()) {
-            error = "A selected platform needs a stream key. Save its key or connect the account first.";
-            return false;
-        }
-        if (d.server.rfind("rtmp://", 0) != 0 && d.server.rfind("rtmps://", 0) != 0) {
-            error = d.name + ": the server must start with rtmp:// or rtmps://.";
-            return false;
-        }
-        targets.push_back({d.name, glint::ingest_url(d.server, key)});
-    }
-    if (targets.empty()) {
-        error = "Select at least one streaming destination first.";
-        return false;
-    }
-    if (targets.size() > 5) {
-        error = "Select at most five simultaneous destinations.";
-        return false;
-    }
-    q.height = store.quality.height;
-    q.fps = store.quality.fps;
-    q.video_kbps = store.quality.video_kbps;
-    return true;
-}
-
-static void go_live(glint::App& app)
-{
-    stream_load();
-    std::vector<glint::BroadcastTarget> targets;
-    glint::BroadcastQuality q;
-    std::string error;
-    if (!build_targets(g_stream.store, targets, q, error)) {
-        ui::toast(error, 2);
-        return;
-    }
-    glint::logf("broadcast: go live to %zu destination(s), %dp%d %d kbps", targets.size(), q.height, q.fps, q.video_kbps);
-    if (app.start_broadcast(targets, q, error)) {
-        ui::toast("Going live to " + std::to_string(targets.size()) + " destination" + (targets.size() == 1 ? "" : "s"), 0);
-    } else {
-        ui::toast(error, 2);
-    }
-}
-
-// Going live is public: the first click arms, the second (within 3 s) starts.
-static void go_live_or_end(glint::App& app)
-{
-    if (app.broadcast_status().active) {
-        app.stop_broadcast("Live broadcast ended.");
-        glint::logf("broadcast: ended by the user");
-        ui::toast("Live broadcast ended", 1);
-        return;
-    }
-    double now = ImGui::GetTime();
-    if (now < g_stream.golive_confirm_until) {
-        g_stream.golive_confirm_until = 0;
-        go_live(app);
-    } else {
-        g_stream.golive_confirm_until = now + 3.0;
-    }
-}
-
-static std::string host_of(const std::string& server)
-{
-    size_t at = server.find("://");
-    std::string rest = at == std::string::npos ? server : server.substr(at + 3);
-    size_t slash = rest.find('/');
-    return slash == std::string::npos ? rest : rest.substr(0, slash);
-}
-
-static void begin_edit(const glint::StreamDestination& d, bool is_new)
-{
-    g_stream.editing = d.id;
-    g_stream.editing_new = is_new;
-    std::snprintf(g_stream.name, sizeof(g_stream.name), "%s", d.name.c_str());
-    std::snprintf(g_stream.server, sizeof(g_stream.server), "%s", d.server.c_str());
-    std::memset(g_stream.key, 0, sizeof(g_stream.key));
-}
-
-static void cancel_edit()
-{
-    if (g_stream.editing_new) g_stream.store.remove(g_stream.editing);
-    g_stream.editing.clear();
-    g_stream.editing_new = false;
-    std::memset(g_stream.key, 0, sizeof(g_stream.key));
-}
-
-static void save_edit()
-{
-    glint::StreamDestination* d = g_stream.store.find(g_stream.editing);
-    if (!d) return;
-    std::string server = g_stream.server;
-    while (!server.empty() && (server.back() == ' ' || server.back() == '/')) server.pop_back();
-    if (server.rfind("rtmp://", 0) != 0 && server.rfind("rtmps://", 0) != 0) {
-        ui::toast("The server must start with rtmp:// or rtmps://.", 2);
-        return;
-    }
-    bool has = g_stream.has_key[d->id];
-    if (!g_stream.key[0] && !has) {
-        ui::toast("Paste your stream key here first.", 2);
-        return;
-    }
-    if (g_stream.key[0]) {
-        std::string error;
-        if (!g_stream.store.set_key(d->id, g_stream.key, error)) {
-            ui::toast(error, 2);
-            return;
-        }
-        g_stream.has_key[d->id] = true;
-    }
-    d->name = g_stream.name[0] ? g_stream.name : glint::platform_label(d->platform);
-    d->server = server;
-    if (g_stream.editing_new && enabled_destinations() > 5) d->enabled = false;
-    stream_save();
-    ui::toast("Saved " + d->name, 1);
-    g_stream.editing.clear();
-    g_stream.editing_new = false;
-    std::memset(g_stream.key, 0, sizeof(g_stream.key));   // don't keep the key around in UI memory
-}
-
-static void destination_editor(const glint::StreamDestination& d)
-{
-    using namespace ui;
-    float iw = px(360);
-    row_begin("Name", "Shown in Glint only.", iw);
-    input("##dname", g_stream.name, sizeof(g_stream.name), iw);
-    row_end();
-    const char* server_desc = d.platform == "tiktok" ? "Copy the server URL from TikTok LIVE Studio."
-                            : d.platform == "custom" ? "Any rtmp:// or rtmps:// ingest URL."
-                                                     : "Filled in for you. Change it only to use a nearby ingest.";
-    row_begin("Server", server_desc, iw);
-    input("##dserver", g_stream.server, sizeof(g_stream.server), iw);
-    row_end();
-    bool has = g_stream.has_key[d.id];
-    row_begin("Stream key", has ? "A key is saved. Leave this empty to keep it." : "Paste your stream key here.", iw);
-    input("##dkey", g_stream.key, sizeof(g_stream.key), iw, true, ImGuiInputTextFlags_Password);
-    row_end();
-    float sw = button_width(icon::check, "Save"), cw = button_width(nullptr, "Cancel");
-    row_begin("", "Keys are stored in Windows Credential Manager, never in a file or the log.", sw + cw + px(10));
-    if (button("##dsave", icon::check, "Save", Kind::Primary, ImVec2(sw, 0))) save_edit();
-    ImGui::SameLine(0, px(10));
-    if (button("##dcancel", nullptr, "Cancel", Kind::Secondary, ImVec2(cw, 0))) cancel_edit();
-    row_end();
-}
-
-static void save_oauth_apps_from_ui()
-{
-    glint::OAuthApps apps;
-    apps.twitch_client_id = g_stream.twitch_id;
-    apps.youtube_client_id = g_stream.youtube_id;
-    std::string error;
-    if (!glint::save_oauth_apps(apps, error)) ui::toast(error, 2);
-}
-
-// A finished sign-in becomes (or refreshes) a destination with its key.
-static void stream_poll_link()
-{
-    glint::AccountLink result;
-    if (!g_stream.linker.take_result(result)) return;
-    stream_load();
-    std::string platform = g_stream.linker.platform();
-    glint::StreamDestination* d = nullptr;
-    for (auto& x : g_stream.store.items())
-        if (x.platform == platform && x.server == result.server) d = &x;
-    if (!d) {
-        d = &g_stream.store.add(platform);
-        if (enabled_destinations() > 5) d->enabled = false;
-    }
-    d->name = platform == "twitch" ? "Twitch (" + result.account + ")" : "YouTube";
-    d->server = result.server;
-    std::string error;
-    if (!g_stream.store.set_key(d->id, result.stream_key, error)) {
-        ui::toast(error, 2);
-        return;
-    }
-    g_stream.has_key[d->id] = true;
-    stream_save();
-    ui::toast(result.message, 1);
-}
-
-static void accounts_card()
-{
-    using namespace ui;
-    glint::AccountLink link = g_stream.linker.snapshot();
-    std::string who = g_stream.linker.platform();
-    bool busy = g_stream.linker.busy();
-    using L = glint::AccountLink::State;
-
-    // Twitch: device code.
-    {
-        bool mine = who == "twitch" && link.state != L::Idle;
-        std::string desc = mine ? link.message
-                                : "Fetches your stream key with your own app's Client ID (create one at dev.twitch.tv/console).";
-        if (mine && link.state == L::WaitingForUser) {
-            float cw = px(150), ow = button_width(nullptr, "Open Twitch"), xw = button_width(nullptr, "Cancel");
-            row_begin("Twitch", ("Enter this code at " + link.verification_uri + ".").c_str(), cw + ow + xw + px(20), 36);
-            ImVec2 p = ImGui::GetCursorScreenPos();
-            ImDrawList* dl = ImGui::GetWindowDrawList();
-            dl->AddRectFilled(p, p + ImVec2(cw, px(36)), ink(C.accent_soft), px(9));
-            ImGui::PushFont(F.strong);
-            ImVec2 ts = ImGui::CalcTextSize(link.user_code.c_str());
-            dl->AddText(p + ImVec2((cw - ts.x) * 0.5f, (px(36) - ts.y) * 0.5f), ink(C.text), link.user_code.c_str());
-            ImGui::PopFont();
-            ImGui::Dummy(ImVec2(cw, px(36)));
-            ImGui::SameLine(0, px(10));
-            if (button("##tw_open", nullptr, "Open Twitch", Kind::Primary, ImVec2(ow, 0)))
-                glint::open_with_default_app(link.verification_uri);
-            ImGui::SameLine(0, px(10));
-            if (button("##tw_cancel", nullptr, "Cancel", Kind::Secondary, ImVec2(xw, 0))) g_stream.linker.cancel();
-            row_end();
-        } else {
-            float iw = px(240), bw = button_width(nullptr, "Sign in with Twitch");
-            row_begin("Twitch", desc.c_str(), iw + px(10) + bw);
-            input("##tw_id", g_stream.twitch_id, sizeof(g_stream.twitch_id), iw, !busy);
-            if (ImGui::IsItemDeactivatedAfterEdit()) save_oauth_apps_from_ui();
-            ImGui::SameLine(0, px(10));
-            if (button("##tw_go", nullptr, "Sign in with Twitch", Kind::Secondary, ImVec2(bw, 0), !busy)) {
-                save_oauth_apps_from_ui();
-                std::string error;
-                if (!g_stream.linker.start_twitch(g_stream.twitch_id, error)) ui::toast(error, 2);
-            }
-            tip("Client ID of your registered Twitch application");
-            row_end();
-        }
-        if (mine && link.state == L::Failed) card_note(C.danger, link.error.c_str());
-    }
-
-    // YouTube: browser sign-in to a loopback address.
-    {
-        bool mine = who == "youtube" && link.state != L::Idle;
-        if (mine && (link.state == L::WaitingForUser || link.state == L::Starting || link.state == L::Fetching)) {
-            float xw = button_width(nullptr, "Cancel");
-            row_begin("YouTube", link.message.c_str(), xw);
-            if (button("##yt_cancel", nullptr, "Cancel", Kind::Secondary, ImVec2(xw, 0))) g_stream.linker.cancel();
-            row_end();
-        } else {
-            float iw = px(240), sw = px(170), bw = button_width(nullptr, "Sign in with YouTube");
-            row_begin("YouTube",
-                      mine ? link.message.c_str()
-                           : "Reads your stream's ingest address and key. Needs a Google desktop OAuth client (ID and secret) "
-                             "with the YouTube Data API enabled.",
-                      iw + sw + bw + px(20));
-            input("##yt_id", g_stream.youtube_id, sizeof(g_stream.youtube_id), iw, !busy);
-            if (ImGui::IsItemDeactivatedAfterEdit()) save_oauth_apps_from_ui();
-            tip("Client ID");
-            ImGui::SameLine(0, px(10));
-            input("##yt_secret", g_stream.youtube_secret, sizeof(g_stream.youtube_secret), sw, !busy,
-                  ImGuiInputTextFlags_Password);
-            if (ImGui::IsItemDeactivatedAfterEdit() && g_stream.youtube_secret[0]) {
-                std::string error;
-                if (glint::vault::write(glint::vault::target("OAuth", "youtube-client-secret"), g_stream.youtube_secret, error))
-                    g_stream.youtube_has_secret = true;
-                else
-                    ui::toast(error, 2);
-                std::memset(g_stream.youtube_secret, 0, sizeof(g_stream.youtube_secret));
-            }
-            tip(g_stream.youtube_has_secret ? "Client secret saved (type to replace it)" : "Client secret");
-            ImGui::SameLine(0, px(10));
-            if (button("##yt_go", nullptr, "Sign in with YouTube", Kind::Secondary, ImVec2(bw, 0), !busy)) {
-                save_oauth_apps_from_ui();
-                std::string secret;
-                glint::vault::read(glint::vault::target("OAuth", "youtube-client-secret"), secret);
-                std::string error;
-                if (!g_stream.linker.start_youtube(g_stream.youtube_id, secret, error)) ui::toast(error, 2);
-            }
-            row_end();
-        }
-        if (mine && link.state == L::Failed) card_note(C.danger, link.error.c_str());
-    }
-    card_note(C.muted, "Signing in creates or updates a destination with the fetched key. Tokens and secrets are kept in "
-                       "Windows Credential Manager.");
-}
-
-static void page_streaming(glint::App& app)
-{
-    using namespace ui;
-    stream_load();
-    glint::BroadcastStatus st = app.broadcast_status();
-    bool live = st.active;
-    page_header("Live streaming",
-                "Send the game picture and console sound to Twitch, YouTube or any RTMP server, up to five at once. "
-                "Glint's own controls are never sent.");
-
-    section("Broadcast");
-    card_begin();
-    {
-        int n = enabled_destinations();
-        bool confirming = ImGui::GetTime() < g_stream.golive_confirm_until;
-        const char* label = live ? "End broadcast" : (confirming ? "Click again to go live" : "Go live");
-        float bw = button_width(live ? icon::stop : icon::stream, label);
-        std::string desc;
-        if (live) {
-            int up = 0;
-            for (const auto& d : st.destinations) up += d.state == glint::BroadcastDestinationStatus::State::Live;
-            desc = "Live for " + format_clock(st.seconds) + " on " + std::to_string(up) + " of " +
-                   std::to_string(st.destinations.size()) + " destination" + (st.destinations.size() == 1 ? "" : "s") + ".";
-        } else if (st.stopping) {
-            desc = "Closing the connections...";
-        } else if (!app.connected()) {
-            desc = "Connect to a console before starting a live broadcast.";
-        } else if (n == 0) {
-            desc = "Turn on at least one destination below.";
-        } else {
-            desc = "Starts every destination that is turned on (" + std::to_string(n) + ").";
-        }
-        row_begin("Go live", desc.c_str(), bw);
-        if (button("##golive", live ? icon::stop : icon::stream, label, live ? Kind::Danger : Kind::Primary,
-                   ImVec2(bw, 0), live || (app.connected() && n > 0 && !st.stopping)))
-            go_live_or_end(app);
-        row_end();
-
-        for (const auto& d : st.destinations) {
-            using S = glint::BroadcastDestinationStatus::State;
-            ImU32 fg = d.state == S::Live ? C.success : d.state == S::Connecting ? C.warn : d.state == S::Failed ? C.danger : C.faint;
-            ImU32 bg = d.state == S::Live ? C.success_soft : d.state == S::Connecting ? C.warn_soft
-                     : d.state == S::Failed ? C.danger_soft : C.nav_active;
-            char line[300];
-            if (d.state == S::Failed)
-                std::snprintf(line, sizeof(line), "%s", d.error.c_str());
-            else
-                std::snprintf(line, sizeof(line), "%.0f kbps sent, %.1f MB%s%s", d.kbps, d.bytes / 1048576.0,
-                              d.dropped_packets ? ", some packets dropped (slow upload)" : "",
-                              d.state == S::Live ? (", live " + format_clock(d.live_seconds)).c_str() : "");
-            const char* name = glint::broadcast_state_name(d.state);
-            row_begin(d.name.c_str(), line, badge_width(name), 24);
-            badge(name, fg, bg);
-            row_end();
-        }
-        if (live || st.stopping) {
-            char note[200];
-            const char* enc = st.encoder == "h264_amf" ? "AMD AMF (GPU)" : st.encoder == "h264_mf" ? "Media Foundation"
-                            : st.encoder == "libx264" ? "x264 (CPU)" : "starting";
-            std::snprintf(note, sizeof(note), "Encoder %s  -  %dx%d at %d fps  -  %llu frames skipped", enc, st.width,
-                          st.height, st.fps, (unsigned long long)st.frames_dropped);
-            card_note(C.muted, note);
-        }
-        if (!st.error.empty()) card_note(C.danger, st.error.c_str());
-    }
-    card_end();
-
-    section("Destinations");
-    card_begin();
-    {
-        auto& items = g_stream.store.items();
-        if (items.empty())
-            row_begin("No destinations yet", "Add a platform below, then paste its stream key.", 0, 20), row_end();
-        for (size_t i = 0; i < items.size(); i++) {
-            glint::StreamDestination& d = items[i];
-            ImGui::PushID(d.id.c_str());
-            if (g_stream.editing == d.id) {
-                destination_editor(d);
-                ImGui::PopID();
-                continue;
-            }
-            bool has = g_stream.has_key[d.id];
-            std::string desc = std::string(glint::platform_label(d.platform)) + "  -  " +
-                               (d.server.empty() ? "no server yet" : host_of(d.server)) + "  -  " +
-                               (has ? "key saved" : "no stream key");
-            bool confirm = g_stream.pending_remove == d.id && ImGui::GetTime() < g_stream.pending_remove_until;
-            float ib = px(36);
-            float rw = confirm ? button_width(icon::trash, "Remove?") : ib;
-            row_begin(d.name.c_str(), desc.c_str(), px(40) + px(14) + ib + px(10) + rw);
-            ImVec2 p = ImGui::GetCursorScreenPos();
-            ImGui::SetCursorScreenPos(p + ImVec2(0, px(7)));
-            bool on = d.enabled;
-            if (toggle("##on", &on, !live)) {
-                if (on && enabled_destinations() >= 5) {
-                    ui::toast("Five destinations is the most you can broadcast to at once.", 2);
-                } else {
-                    d.enabled = on;
-                    stream_save();
-                }
-            }
-            tip(live ? "Stop broadcasting to change it." : "Include in the next broadcast");
-            ImGui::SetCursorScreenPos(p + ImVec2(px(40) + px(14), 0));
-            if (button("##edit", icon::settings, nullptr, Kind::Ghost, ImVec2(ib, 0), !live && g_stream.editing.empty()))
-                begin_edit(d, false);
-            tip("Edit destination");
-            ImGui::SameLine(0, px(10));
-            if (button("##remove", icon::trash, confirm ? "Remove?" : nullptr, confirm ? Kind::Danger : Kind::Ghost,
-                       ImVec2(rw, 0), !live && g_stream.editing.empty())) {
-                if (!confirm) {
-                    g_stream.pending_remove = d.id;
-                    g_stream.pending_remove_until = ImGui::GetTime() + 3.0;
-                } else {
-                    std::string name = d.name;
-                    g_stream.store.remove(d.id);
-                    g_stream.has_key.erase(g_stream.pending_remove);
-                    g_stream.pending_remove.clear();
-                    stream_save();
-                    ui::toast("Removed " + name + " and its stream key", 1);
-                    ImGui::PopID();
-                    row_end();
-                    break;
-                }
-            }
-            if (!confirm) tip("Remove this destination");
-            row_end();
-            ImGui::PopID();
-        }
-
-        static const char* platforms[] = {"twitch", "youtube", "tiktok", "custom"};
-        static const char* labels[] = {"Twitch", "YouTube", "TikTok", "Custom"};
-        float total = 0;
-        for (const char* l : labels) total += button_width(icon::add, l) + px(8);
-        row_begin("Add a destination", g_stream.editing.empty() ? "Pick a platform; the server is filled in when known."
-                                                               : "Save or cancel the destination you are editing.",
-                  total - px(8));
-        for (int i = 0; i < 4; i++) {
-            if (i) ImGui::SameLine(0, px(8));
-            ImGui::PushID(i);
-            if (button("##add", icon::add, labels[i], Kind::Secondary, ImVec2(button_width(icon::add, labels[i]), 0),
-                       !live && g_stream.editing.empty())) {
-                glint::StreamDestination& d = g_stream.store.add(platforms[i]);
-                g_stream.has_key[d.id] = false;
-                if (enabled_destinations() > 5) d.enabled = false;
-                begin_edit(d, true);
-            }
-            ImGui::PopID();
-        }
-        row_end();
-    }
-    card_end();
-
-    section("Accounts");
-    card_begin();
-    accounts_card();
-    card_end();
-
-    section("Quality");
-    card_begin();
-    {
-        glint::StreamQuality& q = g_stream.store.quality;
-        bool changed = false;
-        static const char* res[] = {"480p", "720p", "1080p"};
-        static const int heights[] = {480, 720, 1080};
-        int ri = q.height == 480 ? 0 : q.height == 720 ? 1 : 2;
-        row_begin("Resolution", live ? "Stop broadcasting to change it." : "Scaled from the console picture.",
-                  segmented_width(res, 3, px(72)));
-        if (segmented("##bres", &ri, res, 3, px(72), !live)) { q.height = heights[ri]; changed = true; }
-        row_end();
-        static const char* rates[] = {"30 fps", "60 fps"};
-        int fi = q.fps == 30 ? 0 : 1;
-        row_begin("Frame rate", nullptr, segmented_width(rates, 2, px(72)));
-        if (segmented("##bfps", &fi, rates, 2, px(72), !live)) { q.fps = fi == 0 ? 30 : 60; changed = true; }
-        row_end();
-        float kbps = (float)q.video_kbps;
-        row_begin("Video bitrate", "Higher looks cleaner but needs a faster upload.", px(300), 26);
-        if (slider("##bkbps", &kbps, 1000.0f, 12000.0f, "%.0f kbps", 1.0f, px(300), !live)) {
-            q.video_kbps = (int)(std::lround(kbps / 250.0f) * 250);
-            changed = true;
-        }
-        row_end();
-        card_note(C.muted, "6000 kbps at 1080p60 suits most connections. Encoding uses the GPU when it can (AMD AMF or "
-                           "Media Foundation) and falls back to x264 on the CPU. Keyframe every 2 s, AAC 160 kbps sound.");
-        // Save once the change is complete (a slider drag saves on release).
-        static bool pending = false;
-        pending |= changed;
-        if (pending && !ImGui::IsMouseDown(0)) {
-            stream_save();
-            pending = false;
-        }
-    }
-    card_end();
-}
-#endif // SL_LIVE_STREAMING
 
 static float keycaps_width(const char* const* keys, int count)
 {
@@ -4970,7 +4431,6 @@ static std::string system_info(glint::App& app)
     auto config = app.config();
     auto status = app.status();
     glint::AudioStats a = app.audio().stats();
-    glint::BroadcastStatus b = app.broadcast_status();
     char line[1024];
     float rx_fps = 0.0f, rx_kbps = 0.0f;
     app.received_rate(rx_fps, rx_kbps);
@@ -4978,17 +4438,14 @@ static std::string system_info(glint::App& app)
                   "Console: %s, %s, %dx%d@%d %s, received %.1f fps %.0f kbps (console reports %.1f fps %.0f kbps "
                   "since its encoder started), %d viewer(s)\n"
                   "Decoded frames: %llu, picture held %.0f ms\n"
-                  "Audio: %s, device '%s', %s, buffer %.0f/%.0f ms (%s), playout %.0f ms, underruns %llu, drops %llu\n"
-                  "Broadcast: %s, encoder %s, %zu destination(s)\n",
+                  "Audio: %s, device '%s', %s, buffer %.0f/%.0f ms (%s), playout %.0f ms, underruns %llu, drops %llu\n",
                   app.url().c_str(), app.connected() ? "connected" : "not connected", config.width, config.height,
                   config.fps, config.codec.c_str(), rx_fps, rx_kbps, status.fps, status.kbps, status.clients,
                   (unsigned long long)app.frame_count(), app.video_hold_ms(), a.state.c_str(), a.device.c_str(),
                   a.format.c_str(), a.buffered_ms, a.target_ms, a.auto_delay ? "auto" : "manual", a.playout_ms,
-                  (unsigned long long)a.underruns, (unsigned long long)a.dropped_frames,
-                  b.active ? "live" : "off", b.encoder.empty() ? "-" : b.encoder.c_str(), b.destinations.size());
+                  (unsigned long long)a.underruns, (unsigned long long)a.dropped_frames);
     out += line;
     out += "Settings folder: " + glint::settings_dir() + "\nMedia folder: " + app.media_dir() + "\n";
-    out += "Stream keys, tokens and OAuth settings are not included in this file.\n";
     return out;
 }
 
@@ -5012,8 +4469,7 @@ static void page_help(glint::App& app)
         row_end();
         float cw = button_width(icon::share, "Create file");
         row_begin("Diagnostics file",
-                  "A .zip with the logs, your settings and system details, saved in Downloads, for reporting a problem. "
-                  "Stream keys, tokens and OAuth settings are never included.",
+                  "A .zip with the logs, your settings and system details, saved in Downloads, for reporting a problem.",
                   cw);
         if (button("##diag", icon::share, "Create file", Kind::Primary, ImVec2(cw, 0))) {
             std::string path, error;
@@ -5036,7 +4492,7 @@ static void page_help(glint::App& app)
         {{"R"}, 1, "Start or stop recording on this PC"},
         {{"P"}, 1, "Picture size: fit, fill, no upscaling"},
         {{"L"}, 1, "Latency: lowest, balanced, smooth"},
-        {{"H"}, 1, "Hide or show the controls"},
+        {{"H"}, 1, "Toggle the controls"},
         {{"G"}, 1, "Open or close the gallery"},
         {{"F11"}, 1, "Full screen"},
     };
@@ -5130,11 +4586,7 @@ static void draw_settings(glint::App& app)
 
     // Tabs: text on a hairline, no rounding. The active tab is full-strength
     // with a 2 px underline.
-#if SL_LIVE_STREAMING
-    static const char* tabs[PageCount] = {"Console", "Video", "Picture", "Audio", "Capture", "Streaming", "Help"};
-#else
     static const char* tabs[PageCount] = {"Console", "Video", "Picture", "Audio", "Capture", "Help"};
-#endif
     ImVec2 tp = origin + ImVec2(px(24), px(64));
     float th = px(44);
     sl->AddLine(ImVec2(origin.x, tp.y + th), ImVec2(origin.x + w, tp.y + th), ink(C.border));
@@ -5188,9 +4640,6 @@ static void draw_settings(glint::App& app)
     case PagePicture: page_picture(app); break;
     case PageAudio: page_audio(app); break;
     case PageCapture: page_capture(app); break;
-#if SL_LIVE_STREAMING
-    case PageStreaming: page_streaming(app); break;
-#endif
     default: page_help(app); break;
     }
     ImGui::Dummy(ImVec2(0, px(16)));
@@ -5480,6 +4929,19 @@ static void draw_empty_state(glint::App& app, ImVec2 center)
     if (link != shown) { shown = link; changed_at = ImGui::GetTime(); }
     float fade = ease_out(std::clamp((float)(ImGui::GetTime() - changed_at) / 0.25f, 0.0f, 1.0f));
 
+    const char* title = link == Link::Live ? "Waiting for the picture"
+                      : link == Link::Connecting ? "Connecting to your PS5" : "Connect to your PS5";
+    char sub[512];
+    if (link == Link::Live)
+        std::snprintf(sub, sizeof(sub), "Connected. The first keyframe usually arrives within a second or two.");
+    else if (link == Link::Connecting)
+        std::snprintf(sub, sizeof(sub), "Talking to the Glint payload at %s", g_shell.url);
+    else
+        std::snprintf(sub, sizeof(sub), "Start the Glint payload on the console, then enter its address. "
+                                        "The payload listens on port 7231.");
+
+    // A centred column: the brand, title, line, dots and Cancel are centred in
+    // it; the connect form below them fills its width, left-aligned.
     float w = std::min(px(440), ImGui::GetMainViewport()->Size.x - px(32));
     static float last_h = px(300);
     ImVec2 p(center.x - w * 0.5f, center.y - last_h * 0.5f + (1.0f - fade) * px(8));
@@ -5487,44 +4949,67 @@ static void draw_empty_state(glint::App& app, ImVec2 center)
     ImGui::SetCursorScreenPos(p);
     ImGui::BeginGroup();
     ImGui::PushTextWrapPos(p.x + w - ImGui::GetWindowPos().x);
-
-    const char* title = link == Link::Live ? "Waiting for the picture"
-                      : link == Link::Connecting ? "Connecting to your PS5" : "Connect to your PS5";
+    auto center_x = [&](float item_w) {
+        ImGui::SetCursorScreenPos(ImVec2(p.x + std::floor((w - item_w) * 0.5f), ImGui::GetCursorScreenPos().y));
+    };
+    // Text wrapped to the column, each line centred.
+    auto centered_wrapped = [&](const char* text) {
+        ImFont* font = ImGui::GetFont();
+        float scale = ImGui::GetFontSize() / font->FontSize;
+        const char* s = text;
+        const char* end = text + std::strlen(text);
+        while (s < end) {
+            const char* e = font->CalcWordWrapPositionA(scale, s, end, w);
+            if (e <= s) e = s + 1;
+            const char* trimmed = e;
+            while (trimmed > s && trimmed[-1] == ' ') trimmed--;
+            center_x(ImGui::CalcTextSize(s, trimmed).x);
+            ImGui::TextUnformatted(s, trimmed);
+            s = e;
+            while (s < end && (*s == ' ' || *s == '\n')) s++;
+        }
+    };
     {
-        // The brand above the title: bolt and name.
-        ImGui::PushFont(F.strong);
+        // The brand above the title: bolt and name, centred.
+        ImGui::PushFont(F.display);
+        float bh = px(50), gap = px(12), fs = ImGui::GetFontSize();
+        float bolt_w = 0.6274f * bh;   // draw_bolt's width for this height
+        float lockup = bolt_w + gap + ImGui::CalcTextSize("Glint").x;
+        center_x(lockup);
         ImVec2 at = ImGui::GetCursorScreenPos();
-        float bh = px(22), fs = ImGui::GetFontSize();
-        float bw = draw_bolt(ImGui::GetWindowDrawList(), at, bh, ink(C.text));
-        ImGui::SetCursorScreenPos(at + ImVec2(bw + px(8), (bh - fs) * 0.5f));
+        draw_bolt(ImGui::GetWindowDrawList(), at, bh, ink(C.text));
+        ImGui::SetCursorScreenPos(at + ImVec2(bolt_w + gap, (bh - fs) * 0.5f));
         ImGui::TextUnformatted("Glint");
         ImGui::PopFont();
-        ImGui::SetCursorScreenPos(at + ImVec2(0, bh + px(18)));
+        ImGui::SetCursorScreenPos(ImVec2(p.x, at.y + bh + px(36)));
     }
     ImGui::PushFont(F.display);
+    center_x(ImGui::CalcTextSize(title).x);
     ImGui::TextUnformatted(title);
     ImGui::PopFont();
     ImGui::PushFont(F.small);
     ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(C.muted));
-    if (link == Link::Live)
-        ImGui::TextWrapped("Connected. The first keyframe usually arrives within a second or two.");
-    else if (link == Link::Connecting)
-        ImGui::TextWrapped("Talking to the Glint payload at %s", g_shell.url);
-    else
-        ImGui::TextWrapped("Start the Glint payload on the console, then enter its address. The payload listens on port 7231.");
+    centered_wrapped(sub);
     ImGui::PopStyleColor();
     ImGui::PopFont();
 
     if (link == Link::Connecting) {
-        // Three dots that take turns, then a way out.
+        // Three dots that take turns, then a way out, both centred. The dots
+        // get a row of their own, sized for the largest dot, with the same gap
+        // above and below.
+        const float rmax = px(4.5f), pitch = px(14);
+        const float row_w = 2 * pitch + 2 * rmax;
         ImGui::Dummy(ImVec2(0, px(10)));
-        ImVec2 d = ImGui::GetCursorScreenPos() + ImVec2(px(4), px(4));
+        center_x(row_w);
+        ImVec2 row = ImGui::GetCursorScreenPos();
         for (int i = 0; i < 3; i++) {
             float t = 0.5f + 0.5f * std::sin((float)ImGui::GetTime() * 5.0f - i * 0.8f);
-            ImGui::GetWindowDrawList()->AddCircleFilled(d + ImVec2(i * px(14), 0), px(3) + t * px(1.5f),
+            ImGui::GetWindowDrawList()->AddCircleFilled(row + ImVec2(rmax + i * pitch, rmax), px(3) + t * px(1.5f),
                                                         ImGui::GetColorU32(C.text, 0.3f + 0.7f * t), 16);
         }
-        ImGui::Dummy(ImVec2(0, px(18)));
+        ImGui::Dummy(ImVec2(row_w, 2 * rmax));
+        ImGui::Dummy(ImVec2(0, px(10)));
+        center_x(button_width(nullptr, "Cancel"));
         if (button("##cancel_connect", nullptr, "Cancel", Kind::Secondary)) app.stop();
     } else if (link != Link::Live) {
         ImGui::Dummy(ImVec2(0, px(14)));
@@ -5612,9 +5097,6 @@ static void draw_ui(glint::App& app, VideoTexture& texture)
     ImGuiViewport* vp = ImGui::GetMainViewport();
     update_theme(io.DeltaTime);
     poll_events(app);
-#if SL_LIVE_STREAMING
-    stream_poll_link();
-#endif
     handle_shortcuts(app);
 
     bool has_video = texture.descriptor && texture.width > 0;
@@ -5650,9 +5132,6 @@ static void draw_ui(glint::App& app, VideoTexture& texture)
     if (!has_video) draw_empty_state(app, vp->Pos + vp->Size * 0.5f);
 
     glint::RecorderInfo rec = app.recording_info();
-#if SL_LIVE_STREAMING
-    glint::BroadcastStatus bst = app.broadcast_status();
-#endif
     bool rec_on = recorder_running(rec);
     float m = px(20);
 
@@ -5660,19 +5139,7 @@ static void draw_ui(glint::App& app, VideoTexture& texture)
     // centre even when the controls have faded: you always know you are capturing.
     {
         std::string live_text, rec_text;
-#if SL_LIVE_STREAMING
-        if (bst.active) {
-            int up = 0;
-            for (const auto& d : bst.destinations) up += d.state == glint::BroadcastDestinationStatus::State::Live;
-            live_text = "Live " + format_clock(bst.seconds) + ", " + std::to_string(up) + " of " +
-                        std::to_string(bst.destinations.size());
-        } else if (bst.stopping) {
-            live_text = "Ending the broadcast";
-        }
-        bool live_active = bst.active;
-#else
         bool live_active = false;
-#endif
         if (rec.state != glint::RecorderInfo::State::Idle && rec.state != glint::RecorderInfo::State::Failed)
             rec_text = rec.state == glint::RecorderInfo::State::Recording
                            ? "Recording " + format_clock(rec.seconds)
@@ -5736,14 +5203,7 @@ static void draw_ui(glint::App& app, VideoTexture& texture)
             std::string rec_label = rec_on ? format_clock(rec.seconds) : "Record";
             float bw_shot = button_width(icon::camera, "Screenshot");
             float bw_rec = button_width(icon::record, rec_label.c_str());
-#if SL_LIVE_STREAMING
-            bool live_on = bst.active;
-            bool live_confirm = ImGui::GetTime() < g_stream.golive_confirm_until;
-            std::string live_label = live_on ? "Live " + format_clock(bst.seconds) : (live_confirm ? "Click again to go live" : "Go live");
-            float bw_live = button_width(icon::stream, live_label.c_str()) + gap;
-#else
             float bw_live = 0.0f;
-#endif
             static const char* lat[] = {"Lowest", "Balanced", "Smooth"};
             float lat_w = segmented_width(lat, 3);
             float bw_hide = px(44);
@@ -5785,19 +5245,6 @@ static void draw_ui(glint::App& app, VideoTexture& texture)
                 toggle_local_recording(app);
             tip(rec_on ? "Stop and save the recording  (R)" : "Record on this PC  (R)");
             x += bw_rec;
-#if SL_LIVE_STREAMING
-            x += gap;
-            ImGui::SetCursorScreenPos(ImVec2(x, by));
-            if (button("##dock_live", icon::stream, live_label.c_str(),
-                       live_on ? Kind::Danger : (live_confirm ? Kind::GlassOn : Kind::Ghost), ImVec2(bw_live - gap, bh),
-                       live_on || (app.connected() && !bst.stopping))) {
-                stream_load();
-                go_live_or_end(app);
-            }
-            tip(live_on ? "End the live broadcast" : (live_confirm ? "Goes live on every destination that is on"
-                                                                   : "Go live (asks once more)"));
-            x += bw_live - gap;
-#endif
             separator();
             ImGui::SetCursorScreenPos(ImVec2(x, by + (bh - px(34)) * 0.5f));
             int li = (int)app.latency();
@@ -6053,146 +5500,6 @@ static int run_gallery_test(const std::string& dir)
     return 0;
 }
 
-#if SL_LIVE_STREAMING
-// Headless broadcast test: stream the console to the given RTMP URLs for
-// `seconds` (use a local ingest such as `ffmpeg -listen 1 -i rtmp://...`).
-static int run_broadcast_test(const std::string& url, int seconds, const std::vector<std::string>& targets,
-                              const glint::BroadcastQuality& quality)
-{
-    glint::App app;
-    app.start(url);
-    auto t0 = std::chrono::steady_clock::now();
-    while ((!app.connected() || app.frame_count() < 30 || !app.audio().active()) &&
-           std::chrono::steady_clock::now() - t0 < std::chrono::seconds(20))
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    if (!app.connected()) {
-        std::fprintf(stderr, "not connected: %s\n", app.error().c_str());
-        return 2;
-    }
-    std::vector<glint::BroadcastTarget> list;
-    for (size_t i = 0; i < targets.size(); i++) list.push_back({"dest" + std::to_string(i + 1), targets[i]});
-    std::string error;
-    if (!app.start_broadcast(list, quality, error)) {
-        std::fprintf(stderr, "start failed: %s\n", error.c_str());
-        return 3;
-    }
-    auto print = [&](const char* tag) {
-        glint::BroadcastStatus st = app.broadcast_status();
-        std::printf("[%s] active=%d enc=%s %dx%d@%d in=%llu enc=%llu dropped=%llu err='%s'\n", tag, st.active ? 1 : 0,
-                    st.encoder.c_str(), st.width, st.height, st.fps, (unsigned long long)st.frames_in,
-                    (unsigned long long)st.frames_encoded, (unsigned long long)st.frames_dropped, st.error.c_str());
-        for (const auto& d : st.destinations)
-            std::printf("    %s: %s %.0f kbps %.2f MB dropped=%llu live=%.1fs %s\n", d.name.c_str(),
-                        glint::broadcast_state_name(d.state), d.kbps, d.bytes / 1048576.0,
-                        (unsigned long long)d.dropped_packets, d.live_seconds, d.error.c_str());
-        std::fflush(stdout);
-    };
-    for (int t = 1; t <= seconds; t++) {
-        std::this_thread::sleep_for(std::chrono::seconds(1));
-        if (t % 5 == 0 || t == seconds) {
-            char tag[32];
-            std::snprintf(tag, sizeof(tag), "t=%ds", t);
-            print(tag);
-        }
-    }
-    app.stop_broadcast("test finished");
-    auto s0 = std::chrono::steady_clock::now();
-    while (app.broadcast_status().stopping && std::chrono::steady_clock::now() - s0 < std::chrono::seconds(15))
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    std::printf("stopped in %.2f s\n",
-                std::chrono::duration<double>(std::chrono::steady_clock::now() - s0).count());
-    print("final");
-    app.stop();
-    return 0;
-}
-
-// Destination store test. Run with GLINT_SETTINGS_DIR and GLINT_VAULT_PREFIX set to
-// throwaway values: it writes, re-reads and deletes one destination and key.
-static int run_store_test()
-{
-    const char* dir = std::getenv("GLINT_SETTINGS_DIR");
-    const char* prefix = std::getenv("GLINT_VAULT_PREFIX");
-    if (!dir || !prefix) {
-        std::fprintf(stderr, "set GLINT_SETTINGS_DIR and GLINT_VAULT_PREFIX first\n");
-        return 2;
-    }
-    int failures = 0;
-    auto check = [&](bool ok, const char* what) {
-        std::printf("%s %s\n", ok ? "ok  " : "FAIL", what);
-        if (!ok) failures++;
-    };
-    std::string error;
-    glint::DestinationStore store;
-    check(store.load(error), "load (empty)");
-    glint::StreamDestination& d = store.add("twitch");
-    std::string id = d.id;
-    d.name = "Test Twitch";
-    store.quality.height = 720;
-    store.quality.fps = 30;
-    store.quality.video_kbps = 4500;
-    const std::string secret = "live_test_0123456789abcdef";
-    check(store.set_key(id, secret, error), "set key in vault");
-    check(!store.set_key(id, "has space", error), "reject key with a space");
-    check(store.save(error), "save");
-
-    glint::DestinationStore again;
-    check(again.load(error), "reload");
-    glint::StreamDestination* r = again.find(id);
-    check(r && r->name == "Test Twitch" && r->server == "rtmps://live.twitch.tv/app" && r->enabled,
-          "destination fields round-trip");
-    check(again.quality.height == 720 && again.quality.fps == 30 && again.quality.video_kbps == 4500,
-          "quality round-trips");
-    check(again.has_key(id) && again.key(id) == secret, "key readable from vault");
-    check(glint::ingest_url(r ? r->server : "", again.key(id)) == "rtmps://live.twitch.tv/app/" + secret,
-          "ingest URL = server/key");
-    std::ifstream in(std::filesystem::u8path(again.path()), std::ios::binary);
-    std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-    in.close();   // Windows cannot replace a file that is still open
-    check(!text.empty() && text.find(secret) == std::string::npos, "key is NOT in the conf file");
-    check(text.rfind("GLINT-DESTINATIONS-1", 0) == 0, "conf header");
-
-    again.remove(id);
-    check(again.save(error), "save after remove");
-    check(!again.has_key(id), "vault entry deleted with the destination");
-    glint::DestinationStore last;
-    last.load(error);
-    check(last.items().empty(), "no destinations left");
-
-    glint::OAuthApps apps;
-    apps.twitch_client_id = "abc123";
-    check(glint::save_oauth_apps(apps, error), "save oauth apps");
-    glint::OAuthApps apps2;
-    check(glint::load_oauth_apps(apps2, error) && apps2.twitch_client_id == "abc123", "oauth apps round-trip");
-    apps.twitch_client_id = "bad id";
-    check(!glint::save_oauth_apps(apps, error), "reject client id with a space");
-    std::printf("%s (%d failure%s)\n", failures ? "FAIL" : "PASS", failures, failures == 1 ? "" : "s");
-    return failures ? 1 : 0;
-}
-
-// Go-live test: the Go live button's path (saved destinations, keys from the
-// vault) without the UI. Honour GLINT_SETTINGS_DIR / GLINT_VAULT_PREFIX.
-static int run_golive_test(const std::string& url, int seconds)
-{
-    glint::DestinationStore store;
-    std::string error;
-    if (!store.load(error)) {
-        std::fprintf(stderr, "load: %s\n", error.c_str());
-        return 2;
-    }
-    std::vector<glint::BroadcastTarget> targets;
-    glint::BroadcastQuality q;
-    if (!build_targets(store, targets, q, error)) {
-        std::printf("refused: %s\n", error.c_str());
-        return 3;
-    }
-    std::printf("%zu destination(s), %dp%d at %d kbps:", targets.size(), q.height, q.fps, q.video_kbps);
-    for (auto& t : targets) std::printf(" [%s]", t.name.c_str());   // URLs carry keys: never printed
-    std::printf("\n");
-    std::vector<std::string> urls;
-    for (auto& t : targets) urls.push_back(t.url);
-    return run_broadcast_test(url, seconds, urls, q);
-}
-#endif // SL_LIVE_STREAMING
 
 // Offline decoder test on a recording: Annex-B packets as the payload sends
 // them, decoded as fast as possible. Prints speed and CPU cost, and writes one
@@ -6515,9 +5822,6 @@ int main(int argc, char** argv)
     bool url_given = false;
     std::string yuv_test_file;
     bool yuv_test_gpu = true;
-    int broadcast_test = 0;
-    std::vector<std::string> broadcast_urls;
-    glint::BroadcastQuality broadcast_quality;
     std::string gallery_test_dir;
     int start_page = 0;
     bool start_gallery = false;   // --gallery: open the gallery at start
@@ -6551,13 +5855,6 @@ int main(int argc, char** argv)
         else if (std::strcmp(argv[i], "--gallery") == 0) start_gallery = true;
         else if (std::strcmp(argv[i], "--view") == 0 && i + 1 < argc) { start_view = argv[++i]; start_gallery = true; }
         else if (std::strcmp(argv[i], "--theme") == 0 && i + 1 < argc) start_theme = std::strcmp(argv[++i], "light") == 0 ? 1 : 0;
-#if SL_LIVE_STREAMING
-        else if (std::strcmp(argv[i], "--broadcast-test") == 0 && i + 1 < argc) broadcast_test = std::atoi(argv[++i]);
-        else if (std::strcmp(argv[i], "--broadcast-url") == 0 && i + 1 < argc) broadcast_urls.push_back(argv[++i]);
-        else if (std::strcmp(argv[i], "--broadcast-height") == 0 && i + 1 < argc) broadcast_quality.height = std::atoi(argv[++i]);
-        else if (std::strcmp(argv[i], "--broadcast-fps") == 0 && i + 1 < argc) broadcast_quality.fps = std::atoi(argv[++i]);
-        else if (std::strcmp(argv[i], "--broadcast-kbps") == 0 && i + 1 < argc) broadcast_quality.video_kbps = std::atoi(argv[++i]);
-#endif
         else if (std::strcmp(argv[i], "--yuv-test") == 0 && i + 1 < argc) yuv_test_file = argv[++i];
         else if (std::strcmp(argv[i], "--yuv-test-cpu-decode") == 0) yuv_test_gpu = false;
         else if (std::strcmp(argv[i], "--record-dir") == 0 && i + 1 < argc) record_dir = argv[++i];
@@ -6571,9 +5868,6 @@ int main(int argc, char** argv)
     }
 
     for (int i = 1; i < argc; i++) {
-#if SL_LIVE_STREAMING
-        if (std::strcmp(argv[i], "--store-test") == 0) return run_store_test();   // stream destinations
-#endif
         if (std::strcmp(argv[i], "--settings-test") == 0) return run_settings_test();
         if (std::strcmp(argv[i], "--decode-file") == 0 && i + 1 < argc) {
             // --decode-file <mkv> [gpu|cpu] [hash-file]
@@ -6581,59 +5875,7 @@ int main(int argc, char** argv)
             std::string out = i + 3 < argc ? argv[i + 3] : "";
             return run_decode_file_test(argv[i + 1], gpu, out);
         }
-#if SL_LIVE_STREAMING   // live streaming test modes (off with the feature)
-        if (std::strcmp(argv[i], "--oauth-test") == 0 && i + 1 < argc) {
-            // Sign-in flow against $GLINT_OAUTH_TEST_BASE (a local mock): --oauth-test twitch|youtube [client_id]
-            std::string which = argv[i + 1];
-            std::string client = i + 2 < argc ? argv[i + 2] : "mockclient123";
-            glint::AccountLinker linker;
-            std::string err;
-            bool started = which == "twitch" ? linker.start_twitch(client, err) : linker.start_youtube(client, "mock-secret", err);
-            if (!started) {
-                std::printf("refused: %s\n", err.c_str());
-                return 3;
-            }
-            int last = -1;
-            auto t0 = std::chrono::steady_clock::now();
-            while (std::chrono::steady_clock::now() - t0 < std::chrono::seconds(30)) {
-                glint::AccountLink s = linker.snapshot();
-                if ((int)s.state != last) {
-                    last = (int)s.state;
-                    std::printf("state %d: %s%s%s\n", last, s.message.c_str(), s.user_code.empty() ? "" : "  code=",
-                                s.user_code.c_str());
-                    std::fflush(stdout);
-                }
-                if (s.state == glint::AccountLink::State::Done || s.state == glint::AccountLink::State::Failed) break;
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            }
-            glint::AccountLink result;
-            if (!linker.take_result(result)) {
-                std::printf("FAILED: %s\n", linker.snapshot().error.c_str());
-                return 1;
-            }
-            std::string k = result.stream_key;
-            std::printf("DONE account=%s server=%s key=%s (%zu chars, masked)\n", result.account.c_str(),
-                        result.server.c_str(), k.size() > 2 ? ("****" + k.substr(k.size() - 2)).c_str() : "?", k.size());
-            glint::AccountLink again;
-            std::printf("second take_result: %s\n", linker.take_result(again) ? "returned the key again (BAD)" : "refused (ok)");
-            return 0;
-        }
-        if (std::strcmp(argv[i], "--tls-probe") == 0 && i + 1 < argc) {
-            // TLS handshake only, no data: host[:port]
-            std::string hp = argv[i + 1], err;
-            size_t c = hp.rfind(':');
-            std::string host = c == std::string::npos ? hp : hp.substr(0, c);
-            int port = c == std::string::npos ? 443 : std::atoi(hp.c_str() + c + 1);
-            bool ok = glint::tls_probe(host, port, err);
-            std::printf("%s %s:%d %s\n", ok ? "TRUSTED" : "REFUSED", host.c_str(), port, err.c_str());
-            return ok ? 0 : 1;
-        }
-        if (std::strcmp(argv[i], "--golive-test") == 0 && i + 1 < argc) return run_golive_test(url, std::atoi(argv[i + 1]));
-#endif
     }
-#if SL_LIVE_STREAMING
-    if (broadcast_test > 0) return run_broadcast_test(url, broadcast_test, broadcast_urls, broadcast_quality);
-#endif
     if (!gallery_test_dir.empty()) return run_gallery_test(gallery_test_dir);
     if (record_test > 0) return run_record_test(url, record_test, record_dir, record_disconnect);
     if (audio_cycles > 0) return run_audio_cycles(url, audio_cycles);
@@ -6783,10 +6025,12 @@ int main(int argc, char** argv)
     double last_render = 0.0;
     while (!glfwWindowShouldClose(window)) {
         {
-            double wait = 1.0 / 60.0 - (glfwGetTime() - last_render);
+            // A gliding scroll draws every refresh (V-Sync paces it).
+            double wait = ui::g_ui_animating ? 0.0 : 1.0 / 60.0 - (glfwGetTime() - last_render);
             if (wait > 0.0) glfwWaitEventsTimeout(wait);
             else glfwPollEvents();
             last_render = glfwGetTime();
+            ui::g_ui_animating = false;
         }
 
         int fb_width, fb_height;
@@ -6815,6 +6059,7 @@ int main(int argc, char** argv)
 
         picture_update();
         auto frame = app.take_frame(frame_seen);
+        double t_take = glfwGetTime();
         if (frame && frame->width > 0 && frame->height > 0) {
             present_picture(texture, *frame, app);
             enhance_dump_maybe();
@@ -6855,6 +6100,26 @@ int main(int argc, char** argv)
             wd->ClearValue.color.float32[3] = 1.0f;
             FrameRender(wd, draw_data);
             FramePresent(wd);
+        }
+
+        // Timing for the log: picture taken -> handed to the display, every 10 s.
+        static double ui_sum = 0.0, ui_max = 0.0, ui_since = glfwGetTime();
+        static int ui_frames = 0, ui_renders = 0;
+        ui_renders++;
+        if (frame) {
+            double d = (glfwGetTime() - t_take) * 1000.0;
+            ui_sum += d;
+            ui_max = std::max(ui_max, d);
+            ui_frames++;
+        }
+        if (glfwGetTime() - ui_since >= 10.0) {
+            if (ui_frames > 0)
+                glint::logf("stats: ui %d pictures, %d redraws in %.0f s; take->present avg %.2f max %.2f ms; present mode %d",
+                            ui_frames, ui_renders, glfwGetTime() - ui_since, ui_sum / ui_frames, ui_max,
+                            (int)wd->PresentMode);
+            ui_sum = ui_max = 0.0;
+            ui_frames = ui_renders = 0;
+            ui_since = glfwGetTime();
         }
     }
 

@@ -1,6 +1,6 @@
 #pragma once
-
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -8,6 +8,7 @@
 
 namespace glint {
 
+// GET /config.json
 struct StreamConfig {
     std::string platform;
     int width = 0;
@@ -27,6 +28,7 @@ struct StreamConfig {
     bool profile_error = false;
 };
 
+// GET /status.json
 struct StreamStatus {
     std::string backend;
     int width = 0;
@@ -36,7 +38,7 @@ struct StreamStatus {
     double fps = 0.0;
     double kbps = 0.0;
     int clients = 0;
-    int viewers = 0;                  // people watching (the console allows one)
+    int viewers = 0;
     bool recording = false;
     std::string recording_name;
     unsigned long long recording_frames = 0;
@@ -49,43 +51,41 @@ struct StreamStatus {
     std::string audio_codec;
 };
 
-// stream_frames/stream_audio error when another viewer has the stream (HTTP 409).
-constexpr const char* kTakenOver = "someone else is watching";
-
-// Port the Glint payload listens on.
 constexpr int kPayloadPort = 7231;
 
+// The exact error a stream call returns when the console refused it with 409
+// because another viewer is watching.
+extern const char* const kTakenOver;
+
+// HTTP client for the payload. One instance per thread.
 class PayloadClient {
 public:
-    // base_url like "http://<ps5-ip>:7231" (no trailing slash)
     explicit PayloadClient(std::string base_url);
+
+    const std::string& base_url() const { return base_; }
+    // Optional: a flag that aborts any request in progress when it becomes true.
+    void set_cancel(const std::atomic_bool* cancel) { cancel_ = cancel; }
 
     bool fetch_config(StreamConfig& config, std::string& error);
     bool fetch_status(StreamStatus& status, std::string& error);
-    bool fetch_bytes(const std::string& path, std::vector<uint8_t>& out,
-                     std::string& error, long timeout_ms = 5000);
     bool post(const std::string& path, std::string* body, std::string& error);
 
-    using FrameCallback =
-        std::function<bool(const uint8_t* annexb, size_t len, uint32_t pts)>;
-    using AudioCallback =
-        std::function<bool(const uint8_t* pcm, size_t len, uint32_t pts)>;
+    using FrameCallback = std::function<bool(const uint8_t* annexb, size_t len, uint32_t pts)>;
+    using AudioCallback = std::function<bool(const uint8_t* pcm, size_t len, uint32_t pts)>;
 
     bool stream_frames(const FrameCallback& callback, std::atomic_bool& stop,
                        std::string& error, int idle_timeout_ms = 9000);
     bool stream_audio(const AudioCallback& callback, std::atomic_bool& stop,
                       std::string& error, int idle_timeout_ms = 9000);
 
-    const std::string& base_url() const { return base_; }
-
 private:
+    bool fetch_json(const std::string& path, std::string& body, std::string& error);
+    bool stream_records(const std::string& path, size_t max_len,
+                        const std::function<bool(const uint8_t*, size_t, uint32_t)>& callback,
+                        std::atomic_bool& stop, std::string& error, int idle_timeout_ms);
+
     std::string base_;
+    const std::atomic_bool* cancel_ = nullptr;
 };
 
-std::string json_string(const std::string& document, const std::string& key);
-long long json_int(const std::string& document, const std::string& key, long long fallback = 0);
-double json_double(const std::string& document, const std::string& key, double fallback = 0.0);
-bool json_bool(const std::string& document, const std::string& key, bool fallback = false);
-std::vector<int> json_int_array(const std::string& document, const std::string& key);
-
-} // namespace glint
+}

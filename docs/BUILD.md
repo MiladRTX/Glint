@@ -79,9 +79,9 @@ and builds static libraries with only what the app uses:
 
 - FFmpeg: the H.264 decoder with D3D11VA, the AAC, PNG and H.264 encoders
   (AMF, Media Foundation, x264), MKV/MP4/FLV output, MKV/MP4/image input,
-  and plain RTMP. RTMPS goes through the app's Windows TLS relay
-  (`src/stream/tls_relay.cpp`), so FFmpeg needs no TLS library. x264 makes
-  the FFmpeg build GPL, as MSYS2's own FFmpeg already is.
+  and plain RTMP. The H.264 encoders, FLV and RTMP served the live streaming
+  feature, which has been removed; nothing in the app uses them now. x264
+  makes the FFmpeg build GPL, as MSYS2's own FFmpeg already is.
 - curl: HTTP and HTTPS only, with Schannel (Windows TLS and certificate store),
   built with CMake + Ninja (about 20 seconds; FFmpeg takes most of the time).
 

@@ -1,437 +1,537 @@
 #include "media.h"
+#include "convert.h"
+#include "log.h"
+#include "winutil.h"
+
+#include <shellapi.h>
+#include <zlib.h>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
-#include <libavutil/imgutils.h>
-#include <libavutil/error.h>
 #include <libswscale/swscale.h>
 }
 
-#ifdef _WIN32
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#include <shellapi.h>
-#endif
-
 #include <algorithm>
-#include <chrono>
-#include <cmath>
-#include <cstdlib>
+#include <cctype>
 #include <cstring>
 #include <ctime>
-#include <filesystem>
-#include <fstream>
-#include <fstream>
-
-namespace fs = std::filesystem;
+#include <mutex>
 
 namespace glint {
+
 namespace {
 
-std::string av_text(int code) {
-    char buffer[AV_ERROR_MAX_STRING_SIZE] = {};
-    av_strerror(code, buffer, sizeof(buffer));
-    return buffer;
+bool is_absolute(const std::string& s)
+{
+    if (s.size() >= 3 && std::isalpha((unsigned char)s[0]) && s[1] == ':' && (s[2] == '\\' || s[2] == '/'))
+        return true;
+    return s.size() >= 2 && (s[0] == '\\' || s[0] == '/') && (s[1] == '\\' || s[1] == '/');
 }
 
-std::string stamp() {
+bool path_exists(const std::wstring& p)
+{
+    return GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+
+bool make_dirs(const std::wstring& path)
+{
+    DWORD a = GetFileAttributesW(path.c_str());
+    if (a != INVALID_FILE_ATTRIBUTES) return (a & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    size_t cut = path.find_last_of(L"\\/");
+    if (cut != std::wstring::npos && cut > 2) make_dirs(path.substr(0, cut));
+    return CreateDirectoryW(path.c_str(), nullptr) || GetLastError() == ERROR_ALREADY_EXISTS;
+}
+
+std::string with_slash(std::string dir)
+{
+    if (!dir.empty() && dir.back() != '\\' && dir.back() != '/') dir += '\\';
+    return dir;
+}
+
+std::string lower_ext(const std::string& name)
+{
+    size_t dot = name.find_last_of('.');
+    size_t slash = name.find_last_of("\\/");
+    if (dot == std::string::npos || (slash != std::string::npos && dot < slash)) return std::string();
+    std::string e = name.substr(dot + 1);
+    for (char& c : e) c = (char)std::tolower((unsigned char)c);
+    return e;
+}
+
+std::string local_stamp()
+{
+    char buf[32];
     std::time_t now = std::time(nullptr);
-    std::tm local{};
-#ifdef _WIN32
-    localtime_s(&local, &now);
-#else
-    localtime_r(&now, &local);
-#endif
-    char buffer[32];
-    std::strftime(buffer, sizeof(buffer), "%Y%m%d-%H%M%S", &local);
-    return buffer;
+    std::tm tm{};
+    localtime_s(&tm, &now);
+    std::strftime(buf, sizeof(buf), "%Y%m%d-%H%M%S", &tm);
+    return buf;
 }
 
-std::string lower_ext(const fs::path& path) {
-    std::string ext = path.extension().u8string();
-    std::transform(ext.begin(), ext.end(), ext.begin(),
-                   [](unsigned char c) { return (char)std::tolower(c); });
-    return ext;
+std::string av_error(int code)
+{
+    char buf[AV_ERROR_MAX_STRING_SIZE] = {};
+    av_strerror(code, buf, sizeof(buf));
+    return buf;
 }
 
-} // namespace
+// --- PNG writer (zlib) ----------------------------------------------------------------
 
-std::string default_media_dir() {
-    const char* profile = std::getenv("USERPROFILE");
-    if (!profile || !*profile) profile = std::getenv("HOME");
-    fs::path base = profile ? fs::path(profile) : fs::current_path();
-    fs::path dir = base / "Videos" / "Glint";
-    // Recordings from before the rename: Videos\Screenlink becomes Videos\Glint.
-    // If it cannot be renamed (a file in it is open), keep using it.
-    static bool checked = false;
-    static fs::path old_dir;
-    if (!checked) {
-        checked = true;
-        std::error_code ec;
-        fs::path old = base / "Videos" / "Screenlink";
-        if (!fs::exists(dir, ec) && fs::is_directory(old, ec)) {
-            fs::rename(old, dir, ec);
-            if (ec) old_dir = old;
+void put_be32(std::vector<uint8_t>& v, uint32_t x)
+{
+    v.push_back((uint8_t)(x >> 24));
+    v.push_back((uint8_t)(x >> 16));
+    v.push_back((uint8_t)(x >> 8));
+    v.push_back((uint8_t)x);
+}
+
+void png_chunk(std::vector<uint8_t>& out, const char* type, const uint8_t* data, size_t len)
+{
+    put_be32(out, (uint32_t)len);
+    size_t at = out.size();
+    out.insert(out.end(), type, type + 4);
+    if (len) out.insert(out.end(), data, data + len);
+    uLong crc = crc32(0L, Z_NULL, 0);
+    crc = crc32(crc, out.data() + at, (uInt)(len + 4));
+    put_be32(out, (uint32_t)crc);
+}
+
+// RGB, 8 bits, "Sub" filter on every row.
+bool encode_png(const uint8_t* rgba, int w, int h, std::vector<uint8_t>& png)
+{
+    const size_t stride = (size_t)w * 3 + 1;
+    std::vector<uint8_t> raw(stride * h);
+    for (int y = 0; y < h; y++) {
+        uint8_t* row = raw.data() + stride * y;
+        const uint8_t* src = rgba + (size_t)y * w * 4;
+        row[0] = 1;
+        uint8_t prev[3] = {0, 0, 0};
+        for (int x = 0; x < w; x++) {
+            for (int c = 0; c < 3; c++) {
+                uint8_t v = src[x * 4 + c];
+                row[1 + x * 3 + c] = (uint8_t)(v - prev[c]);
+                prev[c] = v;
+            }
         }
     }
-    return (old_dir.empty() ? dir : old_dir).u8string();
+    uLongf zlen = compressBound((uLong)raw.size());
+    std::vector<uint8_t> z(zlen);
+    if (compress2(z.data(), &zlen, raw.data(), (uLong)raw.size(), 4) != Z_OK) return false;
+
+    static const uint8_t sig[8] = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
+    png.assign(sig, sig + 8);
+    std::vector<uint8_t> ihdr;
+    put_be32(ihdr, (uint32_t)w);
+    put_be32(ihdr, (uint32_t)h);
+    ihdr.push_back(8);   // bit depth
+    ihdr.push_back(2);   // RGB
+    ihdr.push_back(0);
+    ihdr.push_back(0);
+    ihdr.push_back(0);
+    png_chunk(png, "IHDR", ihdr.data(), ihdr.size());
+    png_chunk(png, "IDAT", z.data(), zlen);
+    png_chunk(png, "IEND", nullptr, 0);
+    return true;
 }
 
-bool load_image_rgba(const std::string& path, std::vector<uint8_t>& rgba, int& width,
-                     int& height, std::string& error) {
-    av_log_set_level(AV_LOG_QUIET);
+bool png_size(const std::wstring& path, int& w, int& h)
+{
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return false;
+    uint8_t b[24];
+    DWORD got = 0;
+    bool ok = ReadFile(f, b, sizeof(b), &got, nullptr) && got == sizeof(b);
+    CloseHandle(f);
+    if (!ok || b[0] != 0x89 || std::memcmp(b + 12, "IHDR", 4) != 0) return false;
+    w = (int)((uint32_t)b[16] << 24 | (uint32_t)b[17] << 16 | (uint32_t)b[18] << 8 | b[19]);
+    h = (int)((uint32_t)b[20] << 24 | (uint32_t)b[21] << 16 | (uint32_t)b[22] << 8 | b[23]);
+    return true;
+}
+
+void probe_video(const std::string& path, GalleryItem& item)
+{
+    ffmpeg_setup();
     AVFormatContext* fmt = nullptr;
-    int ret = avformat_open_input(&fmt, path.c_str(), nullptr, nullptr);
-    if (ret < 0) {
-        error = "Could not open the picture: " + av_text(ret);
-        return false;
+    if (avformat_open_input(&fmt, path.c_str(), nullptr, nullptr) < 0) return;
+    if (fmt->duration != AV_NOPTS_VALUE && fmt->duration > 0) item.duration = fmt->duration / (double)AV_TIME_BASE;
+    for (unsigned i = 0; i < fmt->nb_streams; i++) {
+        const AVStream* st = fmt->streams[i];
+        // MP4 has stream durations only until find_stream_info, which is too slow here.
+        if (item.duration == 0.0 && st->duration != AV_NOPTS_VALUE && st->duration > 0 &&
+            (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO || st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO))
+            item.duration = std::max(item.duration, st->duration * av_q2d(st->time_base));
     }
-    bool ok = false;
-    AVCodecContext* ctx = nullptr;
-    AVFrame* frame = av_frame_alloc();
-    AVPacket* packet = av_packet_alloc();
-    SwsContext* sws = nullptr;
-    do {
-        if (avformat_find_stream_info(fmt, nullptr) < 0) { error = "Unreadable picture."; break; }
-        int index = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
-        if (index < 0) { error = "No picture data."; break; }
-        AVStream* stream = fmt->streams[index];
-        const AVCodec* codec = avcodec_find_decoder(stream->codecpar->codec_id);
-        if (!codec) { error = "Unsupported picture format."; break; }
-        ctx = avcodec_alloc_context3(codec);
-        avcodec_parameters_to_context(ctx, stream->codecpar);
-        if (avcodec_open2(ctx, codec, nullptr) < 0) { error = "Unsupported picture format."; break; }
-        bool got = false;
-        while (!got && av_read_frame(fmt, packet) >= 0) {
-            if (packet->stream_index == index && avcodec_send_packet(ctx, packet) >= 0)
-                got = avcodec_receive_frame(ctx, frame) >= 0;
-            av_packet_unref(packet);
+    for (unsigned i = 0; i < fmt->nb_streams; i++) {
+        const AVCodecParameters* par = fmt->streams[i]->codecpar;
+        if (par->codec_type == AVMEDIA_TYPE_AUDIO) item.has_audio = true;
+        if (par->codec_type == AVMEDIA_TYPE_VIDEO && item.width == 0) {
+            item.width = par->width;
+            item.height = par->height;
         }
-        if (!got) {
-            avcodec_send_packet(ctx, nullptr);
-            got = avcodec_receive_frame(ctx, frame) >= 0;
-        }
-        if (!got) { error = "Could not decode the picture."; break; }
-        width = frame->width;
-        height = frame->height;
-        sws = sws_getContext(width, height, (AVPixelFormat)frame->format, width, height,
-                             AV_PIX_FMT_RGBA, SWS_BILINEAR, nullptr, nullptr, nullptr);
-        if (!sws) { error = "Could not convert the picture."; break; }
-        rgba.assign((size_t)width * height * 4, 0);
-        uint8_t* dst[4] = {rgba.data(), nullptr, nullptr, nullptr};
-        int dst_stride[4] = {width * 4, 0, 0, 0};
-        sws_scale(sws, frame->data, frame->linesize, 0, height, dst, dst_stride);
-        ok = true;
-    } while (false);
-    if (sws) sws_freeContext(sws);
-    av_packet_free(&packet);
-    av_frame_free(&frame);
-    if (ctx) avcodec_free_context(&ctx);
+    }
     avformat_close_input(&fmt);
-    return ok;
 }
 
-bool save_screenshot(const std::string& dir, const std::vector<uint8_t>& frame, int width,
-                     int height, std::string& out_path, std::string& error) {
-    if (width <= 0 || height <= 0 || frame.size() < (size_t)width * height * 4) {
-        error = "Screenshot could not be saved.";
-        return false;
-    }
-    fs::path folder = fs::u8path(dir);
-    if (dir.empty() || !folder.is_absolute()) {
-        error = "Choose an absolute destination folder for local recordings.";
-        return false;
-    }
-    std::error_code ec;
-    fs::create_directories(folder, ec);
-    if (ec) {
-        error = "Cannot create screenshot: destination already exists or is not writable.";
-        return false;
-    }
-    fs::path file = folder / ("Glint-Screenshot-" + stamp() + ".png");
-    for (int n = 2; fs::exists(file); n++)
-        file = folder / ("Glint-Screenshot-" + stamp() + "-" + std::to_string(n) + ".png");
+}  // namespace
 
-    std::vector<uint8_t> pixels(frame.begin(), frame.begin() + (size_t)width * height * 4);
+// --- media folder ------------------------------------------------------------------------
 
-    const AVCodec* codec = avcodec_find_encoder(AV_CODEC_ID_PNG);
+std::string default_media_dir()
+{
+    static std::string dir;
+    static std::once_flag once;
+    std::call_once(once, [] {
+        std::string base = env_utf8(L"USERPROFILE");
+        if (base.empty()) base = env_utf8(L"HOME");
+        if (base.empty()) {
+            wchar_t cwd[MAX_PATH * 4];
+            DWORD n = GetCurrentDirectoryW(MAX_PATH * 4, cwd);
+            base = narrow(std::wstring(cwd, n));
+        }
+        std::string videos = with_slash(base) + "Videos\\";
+        dir = videos + "Glint";
+        std::wstring glint = widen(dir), old = widen(videos + "Screenlink");
+        if (!path_exists(glint) && path_exists(old)) {
+            // Folder from before the rename. If it can't move (a file is open), keep using it this run.
+            if (!MoveFileExW(old.c_str(), glint.c_str(), 0)) dir = videos + "Screenlink";
+        }
+    });
+    return dir;
+}
+
+// --- screenshots ---------------------------------------------------------------------------
+
+bool save_screenshot(const std::string& dir, const std::vector<uint8_t>& rgba, int width, int height,
+                     std::string& out_path, std::string& error)
+{
+    if (width <= 0 || height <= 0 || rgba.size() < (size_t)width * height * 4) {
+        error = "There is no picture to save.";
+        return false;
+    }
+    if (!is_absolute(dir)) {
+        error = "The screenshot folder must be a full path.";
+        return false;
+    }
+    if (!make_dirs(widen(dir))) {
+        error = "The screenshot folder could not be created.";
+        return false;
+    }
+    std::vector<uint8_t> png;
+    if (!encode_png(rgba.data(), width, height, png)) {
+        error = "The screenshot could not be encoded.";
+        return false;
+    }
+    std::string stem = with_slash(dir) + "Glint-Screenshot-" + local_stamp();
+    for (int n = 1; n < 1000; n++) {
+        std::string path = n == 1 ? stem + ".png" : stem + "-" + std::to_string(n) + ".png";
+        std::wstring wpath = widen(path);
+        HANDLE f = CreateFileW(wpath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (f == INVALID_HANDLE_VALUE) {
+            if (GetLastError() == ERROR_FILE_EXISTS || GetLastError() == ERROR_ALREADY_EXISTS) continue;
+            error = "The screenshot file could not be created.";
+            return false;
+        }
+        DWORD wrote = 0;
+        bool ok = WriteFile(f, png.data(), (DWORD)png.size(), &wrote, nullptr) && wrote == png.size();
+        ok = CloseHandle(f) && ok;
+        if (!ok) {
+            DeleteFileW(wpath.c_str());
+            error = "Writing the screenshot failed.";
+            return false;
+        }
+        out_path = path;
+        return true;
+    }
+    error = "Too many screenshots with the same name.";
+    return false;
+}
+
+// --- first picture of a file -------------------------------------------------------------
+
+bool load_image_rgba(const std::string& path, std::vector<uint8_t>& rgba, int& width, int& height,
+                     std::string& error)
+{
+    ffmpeg_setup();
+    AVFormatContext* fmt = nullptr;
+    if (avformat_open_input(&fmt, path.c_str(), nullptr, nullptr) < 0) {
+        error = "The file could not be opened.";
+        return false;
+    }
+    avformat_find_stream_info(fmt, nullptr);
+    int vi = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+    const AVCodec* codec = vi >= 0 ? avcodec_find_decoder(fmt->streams[vi]->codecpar->codec_id) : nullptr;
     if (!codec) {
-        error = "Cannot encode the PNG screenshot.";
+        avformat_close_input(&fmt);
+        error = "The file has no picture that can be shown.";
         return false;
     }
     AVCodecContext* ctx = avcodec_alloc_context3(codec);
-    ctx->width = width;
-    ctx->height = height;
-    ctx->pix_fmt = AV_PIX_FMT_RGBA;
-    ctx->time_base = AVRational{1, 1};
-    AVFrame* av = av_frame_alloc();
-    AVPacket* packet = av_packet_alloc();
+    AVPacket* pkt = av_packet_alloc();
+    AVFrame* frame = av_frame_alloc();
     bool ok = false;
-    do {
-        if (avcodec_open2(ctx, codec, nullptr) < 0) { error = "Cannot encode the PNG screenshot."; break; }
-        av->format = AV_PIX_FMT_RGBA;
-        av->width = width;
-        av->height = height;
-        if (av_frame_get_buffer(av, 0) < 0) { error = "Cannot encode the PNG screenshot."; break; }
-        for (int y = 0; y < height; y++)
-            std::memcpy(av->data[0] + (size_t)y * av->linesize[0], &pixels[(size_t)y * width * 4],
-                        (size_t)width * 4);
-        av->pts = 0;
-        if (avcodec_send_frame(ctx, av) < 0 || avcodec_send_frame(ctx, nullptr) < 0 ||
-            avcodec_receive_packet(ctx, packet) < 0) {
-            error = "Cannot encode the PNG screenshot.";
-            break;
+    if (ctx && pkt && frame && avcodec_parameters_to_context(ctx, fmt->streams[vi]->codecpar) >= 0) {
+        ctx->thread_count = 1;
+        ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
+        if (avcodec_open2(ctx, codec, nullptr) >= 0) {
+            bool eof = false;
+            while (!ok) {
+                if (!eof) {
+                    int rc = av_read_frame(fmt, pkt);
+                    if (rc < 0) {
+                        eof = true;
+                        avcodec_send_packet(ctx, nullptr);
+                    } else {
+                        if (pkt->stream_index == vi) avcodec_send_packet(ctx, pkt);
+                        av_packet_unref(pkt);
+                    }
+                }
+                int rc = avcodec_receive_frame(ctx, frame);
+                if (rc == 0) {
+                    ok = frame_to_rgba(frame, rgba, nullptr);
+                    if (ok) {
+                        width = frame->width;
+                        height = frame->height;
+                    }
+                    av_frame_unref(frame);
+                    if (!ok) break;
+                } else if (rc != AVERROR(EAGAIN) || eof) {
+                    if (eof) break;
+                }
+            }
         }
-        std::ofstream out(file, std::ios::binary | std::ios::trunc);
-        out.write((const char*)packet->data, packet->size);
-        out.close();
-        if (!out) {
-            std::error_code ignore;
-            fs::remove(file, ignore);
-            error = "Cannot write the screenshot.";
-            break;
-        }
-        ok = true;
-    } while (false);
-    av_packet_free(&packet);
-    av_frame_free(&av);
+    }
+    av_frame_free(&frame);
+    av_packet_free(&pkt);
     avcodec_free_context(&ctx);
-    if (ok) out_path = file.u8string();
+    avformat_close_input(&fmt);
+    if (!ok) error = "No picture could be decoded from the file.";
     return ok;
 }
 
-FolderWatch::~FolderWatch() { close(); }
+// --- gallery -------------------------------------------------------------------------------
 
-void FolderWatch::close() {
-    if (handle_ && handle_ != INVALID_HANDLE_VALUE) FindCloseChangeNotification((HANDLE)handle_);
-    handle_ = nullptr;
-}
-
-void FolderWatch::watch(const std::string& dir) {
-    if (dir == dir_ && handle_ && handle_ != INVALID_HANDLE_VALUE) return;
-    close();
-    dir_ = dir;
-    // A folder that doesn't exist yet can't be watched; watch() is called
-    // again on the next refresh and picks it up once it does.
-    std::wstring wide = fs::u8path(dir).wstring();
-    HANDLE h = FindFirstChangeNotificationW(wide.c_str(), FALSE,
-                                            FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_SIZE |
-                                                FILE_NOTIFY_CHANGE_LAST_WRITE);
-    handle_ = h == INVALID_HANDLE_VALUE ? nullptr : (void*)h;
-}
-
-bool FolderWatch::changed() {
-    if (!handle_) return false;
-    if (WaitForSingleObject((HANDLE)handle_, 0) != WAIT_OBJECT_0) return false;
-    if (!FindNextChangeNotification((HANDLE)handle_)) close();   // the folder went away: watch again later
-    return true;
-}
-
-std::vector<GalleryItem> list_gallery(const std::string& dir) {
+std::vector<GalleryItem> list_gallery(const std::string& dir)
+{
     std::vector<GalleryItem> items;
-    std::error_code ec;
-    fs::path folder = fs::u8path(dir);
-    if (!fs::is_directory(folder, ec)) return items;
-
-    auto file_now = fs::file_time_type::clock::now();
-    auto sys_now = std::chrono::system_clock::now();
-
-    for (const auto& entry : fs::directory_iterator(folder, ec)) {
-        if (!entry.is_regular_file(ec)) continue;
-        std::string ext = lower_ext(entry.path());
-        if (ext != ".mkv" && ext != ".mp4" && ext != ".png") continue;
+    if (dir.empty()) return items;
+    std::string folder = with_slash(dir);
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(widen(folder + "*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return items;
+    do {
+        if (fd.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_DEVICE)) continue;
+        std::string name = narrow(fd.cFileName);
+        std::string ext = lower_ext(name);
+        if (ext != "mkv" && ext != "mp4" && ext != "png") continue;
         GalleryItem item;
-        item.path = entry.path().u8string();
-        item.name = entry.path().filename().u8string();
-        item.video = ext != ".png";
-        item.size = entry.file_size(ec);
-        auto age = file_now - entry.last_write_time(ec);
-        item.modified = std::chrono::duration_cast<std::chrono::seconds>(
-                            (sys_now - age).time_since_epoch()).count();
-        if (item.video) {
-            AVFormatContext* fmt = nullptr;
-            av_log_set_level(AV_LOG_QUIET);
-            if (avformat_open_input(&fmt, item.path.c_str(), nullptr, nullptr) >= 0) {
-                if (avformat_find_stream_info(fmt, nullptr) >= 0) {
-                    if (fmt->duration > 0) item.duration = (double)fmt->duration / AV_TIME_BASE;
-                    for (unsigned i = 0; i < fmt->nb_streams; i++) {
-                        const AVCodecParameters* p = fmt->streams[i]->codecpar;
-                        if (p->codec_type == AVMEDIA_TYPE_AUDIO) item.has_audio = true;
-                        if (p->codec_type == AVMEDIA_TYPE_VIDEO) {
-                            item.width = p->width;
-                            item.height = p->height;
-                        }
-                    }
-                }
-                avformat_close_input(&fmt);
-            }
-        } else {
-            // A PNG's size is in its header: the IHDR chunk right after the
-            // 8-byte signature holds width and height (big-endian) at 16..23.
-            std::ifstream png(entry.path(), std::ios::binary);
-            unsigned char head[24] = {};
-            if (png.read(reinterpret_cast<char*>(head), sizeof(head)) && head[1] == 'P' && head[2] == 'N' &&
-                head[3] == 'G' && std::memcmp(head + 12, "IHDR", 4) == 0) {
-                auto be32 = [&](int at) { return (int)((head[at] << 24) | (head[at + 1] << 16) | (head[at + 2] << 8) | head[at + 3]); };
-                item.width = be32(16);
-                item.height = be32(20);
-            }
-        }
-        items.push_back(std::move(item));
+        item.name = name;
+        item.path = folder + name;
+        item.video = ext != "png";
+        item.size = ((uint64_t)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+        uint64_t ft = ((uint64_t)fd.ftLastWriteTime.dwHighDateTime << 32) | fd.ftLastWriteTime.dwLowDateTime;
+        item.modified = ft > 116444736000000000ull ? (int64_t)((ft - 116444736000000000ull) / 10000000ull) : 0;
+        items.push_back(item);
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+
+    for (GalleryItem& item : items) {
+        if (item.video) probe_video(item.path, item);
+        else png_size(widen(item.path), item.width, item.height);
     }
-    std::sort(items.begin(), items.end(),
-              [](const GalleryItem& a, const GalleryItem& b) { return a.modified > b.modified; });
+    std::sort(items.begin(), items.end(), [](const GalleryItem& a, const GalleryItem& b) {
+        if (a.modified != b.modified) return a.modified > b.modified;
+        return a.name > b.name;
+    });
     return items;
 }
 
-bool delete_gallery_file(const std::string& path, std::string& error) {
-    std::error_code ec;
-    fs::path file = fs::u8path(path);
-    std::string ext = lower_ext(file);
-    if (ext != ".mkv" && ext != ".mp4" && ext != ".png") {
-        error = "Could not delete the gallery file.";
+struct FolderWatch::Impl {
+    std::string dir;
+    HANDLE handle = INVALID_HANDLE_VALUE;
+    bool pending = false;
+    ULONGLONG last_try = 0;
+
+    void close()
+    {
+        if (handle != INVALID_HANDLE_VALUE) FindCloseChangeNotification(handle);
+        handle = INVALID_HANDLE_VALUE;
+    }
+    void open()
+    {
+        handle = FindFirstChangeNotificationW(
+            widen(dir).c_str(), FALSE,
+            FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE);
+        if (handle != INVALID_HANDLE_VALUE) pending = true;   // the folder (re)appeared: refresh once
+        last_try = GetTickCount64();
+    }
+};
+
+FolderWatch::FolderWatch() : impl_(new Impl) {}
+
+FolderWatch::~FolderWatch()
+{
+    impl_->close();
+}
+
+void FolderWatch::watch(const std::string& dir)
+{
+    Impl& d = *impl_;
+    if (dir == d.dir) {
+        // A missing folder is retried at most twice a second.
+        if (d.handle == INVALID_HANDLE_VALUE && !dir.empty() && GetTickCount64() - d.last_try > 500) d.open();
+        return;
+    }
+    d.close();
+    d.dir = dir;
+    d.pending = false;
+    if (!dir.empty()) d.open();
+}
+
+bool FolderWatch::changed()
+{
+    Impl& d = *impl_;
+    bool any = d.pending;
+    d.pending = false;
+    if (d.handle == INVALID_HANDLE_VALUE) return any;
+    while (WaitForSingleObject(d.handle, 0) == WAIT_OBJECT_0) {
+        any = true;
+        if (!FindNextChangeNotification(d.handle)) {
+            d.close();   // the folder went away; watch() picks it up again
+            break;
+        }
+    }
+    return any;
+}
+
+bool delete_gallery_file(const std::string& path, std::string& error)
+{
+    std::string ext = lower_ext(path);
+    if (ext != "mkv" && ext != "mp4" && ext != "png") {
+        error = "Only recordings and screenshots can be deleted here.";
         return false;
     }
-    if (!fs::remove(file, ec) || ec) {
-        error = "Could not delete the gallery file.";
+    if (!DeleteFileW(widen(path).c_str())) {
+        error = GetLastError() == ERROR_SHARING_VIOLATION ? "The file is in use and could not be deleted."
+                                                          : "The file could not be deleted.";
         return false;
     }
     return true;
 }
 
-bool export_copy(const std::string& source, const std::string& ext, std::string& out_path,
-                 std::string& error) {
+// --- export ------------------------------------------------------------------------------
+
+bool export_copy(const std::string& source, const std::string& ext, std::string& out_path, std::string& error)
+{
     if (ext != "mp4" && ext != "mkv") {
-        error = "Choose MP4 or MKV as the export format.";
+        error = "Export works only to MP4 or MKV.";
         return false;
     }
-    fs::path in_path = fs::u8path(source);
-    fs::path out = in_path.parent_path() /
-                   (in_path.stem().u8string() + "-export-" + stamp() + "." + ext);
-    std::error_code same_ec;
-    if (in_path == out || fs::equivalent(in_path, out, same_ec)) {
-        error = "The exported file must differ from the original.";
+    ffmpeg_setup();
+    size_t slash = source.find_last_of("\\/");
+    std::string folder = slash == std::string::npos ? std::string() : source.substr(0, slash + 1);
+    std::string name = slash == std::string::npos ? source : source.substr(slash + 1);
+    size_t dot = name.find_last_of('.');
+    std::string stem = dot == std::string::npos ? name : name.substr(0, dot);
+    std::string out = folder + stem + "-export-" + local_stamp() + "." + ext;
+    std::wstring wout = widen(out);
+    if (_wcsicmp(wout.c_str(), widen(source).c_str()) == 0 || path_exists(wout)) {
+        error = "An export with this name already exists; try again in a second.";
         return false;
     }
-    if (fs::exists(out)) {
-        error = "The exported file already exists.";
-        return false;
-    }
-    std::string out_utf8 = out.u8string();
 
-    av_log_set_level(AV_LOG_QUIET);
     AVFormatContext* in = nullptr;
-    AVFormatContext* dst = nullptr;
-    bool ok = false;
-    bool header = false;
-    std::vector<int> map;
-    AVPacket* packet = av_packet_alloc();
-    do {
-        if (avformat_open_input(&in, source.c_str(), nullptr, nullptr) < 0) {
-            error = "Could not open the recording for export.";
-            break;
-        }
-        if (avformat_find_stream_info(in, nullptr) < 0) {
-            error = "Could not read the recording for export.";
-            break;
-        }
-        if (avformat_alloc_output_context2(&dst, nullptr, ext == "mp4" ? "mp4" : "matroska",
-                                           out_utf8.c_str()) < 0 || !dst) {
-            error = "Could not create the exported file.";
-            break;
-        }
-        map.assign(in->nb_streams, -1);
-        int copied = 0;
-        for (unsigned i = 0; i < in->nb_streams; i++) {
-            AVCodecParameters* p = in->streams[i]->codecpar;
-            if (p->codec_type != AVMEDIA_TYPE_VIDEO && p->codec_type != AVMEDIA_TYPE_AUDIO) continue;
-            AVStream* s = avformat_new_stream(dst, nullptr);
-            if (!s || avcodec_parameters_copy(s->codecpar, p) < 0) {
-                error = "Could not copy a stream to the exported file.";
-                copied = -1;
-                break;
-            }
-            s->codecpar->codec_tag = 0;
-            s->time_base = in->streams[i]->time_base;
-            s->avg_frame_rate = in->streams[i]->avg_frame_rate;
-            map[i] = s->index;
-            copied++;
-        }
-        if (copied < 0) break;
-        if (copied == 0) {
-            error = "The recording has no video or audio streams to export.";
-            break;
-        }
-        if (avio_open(&dst->pb, out_utf8.c_str(), AVIO_FLAG_WRITE) < 0) {
-            error = "Could not create the exported file.";
-            break;
-        }
-        AVDictionary* options = nullptr;
-        if (ext == "mp4") av_dict_set(&options, "movflags", "+faststart", 0);
-        int ret = avformat_write_header(dst, &options);
-        av_dict_free(&options);
-        if (ret < 0) {
-            error = "Could not start the exported file.";
-            break;
-        }
-        header = true;
-        bool write_failed = false;
-        while (av_read_frame(in, packet) >= 0) {
-            int target = packet->stream_index < (int)map.size() ? map[packet->stream_index] : -1;
-            if (target < 0) { av_packet_unref(packet); continue; }
-            av_packet_rescale_ts(packet, in->streams[packet->stream_index]->time_base,
-                                 dst->streams[target]->time_base);
-            packet->stream_index = target;
-            packet->pos = -1;
-            if (av_interleaved_write_frame(dst, packet) < 0) {
-                write_failed = true;
-                av_packet_unref(packet);
-                break;
-            }
-        }
-        if (write_failed) {
-            error = "Could not write the exported recording.";
-            break;
-        }
-        if (av_write_trailer(dst) < 0) {
-            header = false;
-            error = "Could not finish the exported recording.";
-            break;
-        }
-        header = false;
-        ok = true;
-    } while (false);
-
-    if (dst) {
-        if (header) av_write_trailer(dst);
-        if (dst->pb) avio_closep(&dst->pb);
-        avformat_free_context(dst);
-    }
-    if (in) avformat_close_input(&in);
-    av_packet_free(&packet);
-    if (!ok) {
-        std::error_code ignore;
-        fs::remove(out, ignore);
+    if (avformat_open_input(&in, source.c_str(), nullptr, nullptr) < 0) {
+        error = "The recording could not be opened.";
         return false;
     }
-    out_path = out_utf8;
+    avformat_find_stream_info(in, nullptr);
+
+    AVFormatContext* outc = nullptr;
+    std::vector<int> map(in->nb_streams, -1);
+    bool created = false;
+    auto fail = [&](const std::string& why) {
+        if (outc) {
+            if (outc->pb) avio_closep(&outc->pb);
+            avformat_free_context(outc);
+        }
+        avformat_close_input(&in);
+        if (created) DeleteFileW(wout.c_str());
+        error = why;
+        return false;
+    };
+
+    if (avformat_alloc_output_context2(&outc, nullptr, ext == "mp4" ? "mp4" : "matroska", out.c_str()) < 0 || !outc) {
+        outc = nullptr;
+        return fail("The export could not be prepared.");
+    }
+    int streams = 0;
+    for (unsigned i = 0; i < in->nb_streams; i++) {
+        AVStream* is = in->streams[i];
+        AVMediaType type = is->codecpar->codec_type;
+        if (type != AVMEDIA_TYPE_VIDEO && type != AVMEDIA_TYPE_AUDIO) continue;
+        AVStream* os = avformat_new_stream(outc, nullptr);
+        if (!os || avcodec_parameters_copy(os->codecpar, is->codecpar) < 0) return fail("Out of memory while exporting.");
+        os->codecpar->codec_tag = 0;
+        os->time_base = is->time_base;
+        os->avg_frame_rate = is->avg_frame_rate;
+        os->r_frame_rate = is->r_frame_rate;
+        os->disposition = is->disposition;
+        map[i] = os->index;
+        streams++;
+    }
+    if (streams == 0) return fail("The file has no video or sound to export.");
+
+    int rc = avio_open(&outc->pb, out.c_str(), AVIO_FLAG_WRITE);
+    if (rc < 0) return fail("The export file could not be created (" + av_error(rc) + ").");
+    created = true;
+    AVDictionary* opts = nullptr;
+    if (ext == "mp4") av_dict_set(&opts, "movflags", "+faststart", 0);
+    rc = avformat_write_header(outc, &opts);
+    av_dict_free(&opts);
+    if (rc < 0) return fail("The export could not be written (" + av_error(rc) + ").");
+
+    AVPacket* pkt = av_packet_alloc();
+    std::vector<int64_t> last_dts(in->nb_streams, AV_NOPTS_VALUE);
+    while (pkt && (rc = av_read_frame(in, pkt)) >= 0) {
+        int oi = map[pkt->stream_index];
+        if (oi < 0) {
+            av_packet_unref(pkt);
+            continue;
+        }
+        if (pkt->dts == AV_NOPTS_VALUE) pkt->dts = pkt->pts;
+        int64_t& last = last_dts[pkt->stream_index];
+        if (last != AV_NOPTS_VALUE && pkt->dts != AV_NOPTS_VALUE && pkt->dts <= last) {
+            // Keep decode times strictly increasing for MP4.
+            pkt->dts = last + 1;
+            if (pkt->pts != AV_NOPTS_VALUE && pkt->pts < pkt->dts) pkt->pts = pkt->dts;
+        }
+        last = pkt->dts;
+        av_packet_rescale_ts(pkt, in->streams[pkt->stream_index]->time_base, outc->streams[oi]->time_base);
+        pkt->stream_index = oi;
+        pkt->pos = -1;
+        rc = av_interleaved_write_frame(outc, pkt);
+        if (rc < 0) {
+            av_packet_free(&pkt);
+            return fail("Writing the export failed (" + av_error(rc) + ").");
+        }
+    }
+    av_packet_free(&pkt);
+    rc = av_write_trailer(outc);
+    if (rc < 0) return fail("Finishing the export failed (" + av_error(rc) + ").");
+    avio_closep(&outc->pb);
+    avformat_free_context(outc);
+    avformat_close_input(&in);
+    out_path = out;
+    logf("export: %s -> %s", source.c_str(), out.c_str());
     return true;
 }
 
-bool open_with_default_app(const std::string& path) {
-#ifdef _WIN32
-    int wide_len = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
-    if (wide_len <= 0) return false;
-    std::wstring wide((size_t)wide_len, L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, &wide[0], wide_len);
-    return (INT_PTR)ShellExecuteW(nullptr, L"open", wide.c_str(), nullptr, nullptr, SW_SHOWNORMAL) > 32;
-#else
-    (void)path;
-    return false;
-#endif
+bool open_with_default_app(const std::string& path)
+{
+    INT_PTR rc = (INT_PTR)ShellExecuteW(nullptr, L"open", widen(path).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    return rc > 32;
 }
 
-} // namespace glint
+}

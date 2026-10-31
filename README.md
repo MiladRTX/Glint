@@ -4,7 +4,7 @@
 
 **Watch, hear and record a jailbroken PS5 on your Windows PC, with low latency.**
 
-![Version](https://img.shields.io/badge/version-1.2.1-informational)
+![Version](https://img.shields.io/badge/version-1.3-informational)
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078D6)
 ![Console](https://img.shields.io/badge/console-PS5%20(jailbroken)-003791)
 ![Language](https://img.shields.io/badge/C%2B%2B17%20%2B%20C11-00599C)
@@ -100,7 +100,7 @@ Download both from the [latest release](https://github.com/MiladRTX/Glint/releas
 or build them yourself ([Building](#building)):
 
 - `Glint.exe`, the Windows app (one file, nothing to install)
-- `Glint-1.2.1-ps5.elf`, the PS5 payload
+- `Glint-1.3-ps5.elf`, the PS5 payload
 
 ### 2. Run the payload
 
@@ -108,14 +108,14 @@ Upload the ELF to Payload Manager's folder on the console (FTP on port 2121
 here; use your console's IP):
 
 ```bash
-curl --ftp-create-dirs -T Glint-1.2.1-ps5.elf ftp://<ps5-ip>:2121/data/pldmgr/payloads/local/glint/Glint-1.2.1-ps5.elf
+curl --ftp-create-dirs -T Glint-1.3-ps5.elf ftp://<ps5-ip>:2121/data/pldmgr/payloads/local/glint/Glint-1.3-ps5.elf
 ```
 
 A self-built ELF is `payload/build/glint-payload.elf`; upload it under the same
 name.
 
 Then start **Glint** from Payload Manager on the console. You will see
-*"Glint 1.2.1 loaded. Starting capture..."*, then *"Glint ready on
+*"Glint 1.3 loaded. Starting capture..."*, then *"Glint ready on
 port 7231"*.
 
 > [!TIP]
@@ -206,7 +206,7 @@ dependency: [docs/BUILD.md](docs/BUILD.md).
 | `S` | Screenshot | | `H` | Hide controls |
 | `R` | Start/stop recording | | `T` | Dark / light theme |
 | `G` | Gallery | | `F11` | Full screen |
-| `P` | Picture size (fit / fill / no upscaling) | | `Ctrl+,` | Settings |
+| `P` | Picture fit (fit / fill / no upscaling) | | `Ctrl+,` | Settings |
 | `C` | Side-by-side compare | | `X` | Tweak panel (in compare) |
 
 In the viewer: `Space` play/pause, `←` `→` seek 5 s (or previous/next
@@ -312,7 +312,9 @@ Built with [Dear ImGui](https://github.com/ocornut/imgui),
 [FFmpeg](https://ffmpeg.org/), [curl](https://curl.se/),
 [SDL2](https://www.libsdl.org/), [GLFW](https://www.glfw.org/),
 [x264](https://www.videolan.org/developers/x264.html), the
-[Geist](https://vercel.com/font) typeface (SIL OFL), the
+[Inter](https://rsms.me/inter/), [Space Grotesk](https://github.com/floriankarsten/space-grotesk)
+and [JetBrains Mono](https://www.jetbrains.com/lp/mono/) typefaces in the app and
+[Geist](https://vercel.com/font) in the browser dashboard (all SIL OFL), the
 [PS5 payload SDK](https://github.com/ps5-payload-dev/sdk),
 [AMD FidelityFX FSR 1](https://github.com/GPUOpen-Effects/FidelityFX-FSR) (MIT) and
 [FSRCNNX](https://github.com/igv/FSRCNN-TensorFlow) (LGPL-3.0) for the upscalers.
@@ -320,9 +322,9 @@ Built with [Dear ImGui](https://github.com/ocornut/imgui),
 ## License
 
 Glint is licensed under the [GNU General Public License v3.0](LICENSE).
-Third-party parts keep their own licenses: Dear ImGui (MIT), Geist (SIL OFL
-1.1, `app/vendor/fonts/OFL.txt`), FFmpeg built with x264 (GPL), curl, SDL2 and
-GLFW (permissive).
+Third-party parts keep their own licenses: Dear ImGui (MIT), Inter, Space
+Grotesk and JetBrains Mono (SIL OFL 1.1, `app/vendor/fonts/OFL-*.txt`), FFmpeg
+built with x264 (GPL), curl, SDL2 and GLFW (permissive).
 
 ## Disclaimer
 

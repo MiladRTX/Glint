@@ -1,5 +1,37 @@
 # Changelog
 
+## [1.3] - 2026-10-31
+
+Upload the payload as `/data/pldmgr/payloads/local/glint/Glint-1.3-ps5.elf`.
+
+### Payload (PS5)
+
+- **Lower latency:** the payload now sees each finished capture call within
+  0.1 ms instead of checking every 5 ms. It makes several such calls per
+  frame, so frames and sound leave the console sooner and more evenly.
+- **35 Mbit/s by default** (was 50). The encoder caps every frame at
+  bitrate / 60; over Wi-Fi a busy game at 50 or more stalled, 35 stays smooth
+  at 60 fps. With the PS5 on a cable, `bitrate=N` (up to 100 Mbit/s) keeps
+  busy scenes sharper.
+
+### Desktop app
+
+- **Sound much closer to the picture:** about 55-80 ms behind instead of
+  95-130 ms, from a smaller output buffer and a tighter automatic delay.
+- **Sound recovers after a console freeze:** the backlog is skipped instead of
+  playing up to a second behind for half a minute, and one freeze no longer
+  holds the sound delay at 400 ms for a minute.
+- Pictures go to the screen at the next refresh without queueing when the
+  graphics driver supports it (mailbox present mode). Settings and the
+  gallery scroll at the monitor's full refresh rate.
+- **New look:** centred connect screens with a larger logo, and new fonts:
+  Space Grotesk for headings, Inter for text, JetBrains Mono for numbers.
+  The Picture tab now has its heading like the other tabs.
+- `glint.log` gets a `stats:` line every 10 s while connected: received fps,
+  network lateness, decode time, sound buffer, frame sizes and encoder QP.
+- Clearer wording in Settings, for example **Picture fit** and **Game audio**.
+- Live streaming, already switched off since 1.0, is removed.
+
 ## [1.2.1] - 2026-10-30
 
 Upload the payload as `/data/pldmgr/payloads/local/glint/Glint-1.2.1-ps5.elf`.

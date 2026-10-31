@@ -15,15 +15,16 @@ plays the sound and drives the payload API.
   frames in amber, hold and bitrate), round gallery / full screen / settings
   buttons and a command bar (sound + volume, screenshot, record,
   latency Lowest/Balanced/Smooth, hide) float over it and fade after 3 s without
-  input. Recording and live stay shown at the top centre. Settings is a sheet
-  that slides in from the right (Console, Video, Audio, Capture, Streaming,
+  input. Recording stays shown at the top centre. Settings is a sheet
+  that slides in from the right (Console, Video, Picture, Audio, Capture,
   Help); the gallery is a full-window grid with thumbnails. Without a picture
   the window shows a connect screen with recent consoles.
 - Dark (default) and light theme, cross-fading when you switch (Video page or T).
-  Geist and Geist Mono are embedded in the exe (`vendor/fonts`, SIL OFL;
+  Inter (text), Space Grotesk (headings) and JetBrains Mono (live numbers) are
+  embedded in the exe (`vendor/fonts`, SIL OFL;
   regenerate `src/fonts.inc` with `node tools/embed_fonts.js`). Icons come from
   Segoe Fluent Icons (Windows 11); without that font the UI falls back to text.
-  Shortcuts: M sound, S screenshot, R record, G gallery, P picture size,
+  Shortcuts: M sound, S screenshot, R record, G gallery, P picture fit,
   L latency, H hide controls, T theme, F11 full screen, Ctrl+, settings, Esc close.
 - Console recording start/stop, keyframe, stop stream. Capture is 1080p60.
 - Local PC recording to MKV (H.264 stream-copy + AAC), PNG screenshots, and a
@@ -31,23 +32,18 @@ plays the sound and drives the payload API.
   a built-in viewer (sound, seek, volume; zoom and pan for pictures; Space,
   arrows, Page Up/Down, Esc). Default folder
   `%USERPROFILE%\Videos\Glint`.
-- Live streaming is **switched off in this build** (`SL_LIVE_STREAMING` in
-  `src/main.cpp`; build with `-DSL_LIVE_STREAMING=1` to bring it back). When on
-  (Settings > Streaming, Go live in the command bar): up to 5 RTMP/RTMPS
-  destinations at once (Twitch, YouTube, TikTok, custom), re-encoded with the
-  GPU when possible (AMD AMF, Media Foundation, else x264), keyframe every 2 s.
-  RTMPS goes through Windows TLS with certificate checks. Keys and tokens live
-  in Windows Credential Manager. Optional Twitch/YouTube sign-in with your own
-  registered app fetches the key for you.
 - SDL2 audio playback of the payload `/audio` stream: Sound on/off, volume 0-4x,
   delay Auto (default, sized from measured network jitter) or manual 0-400 ms.
+  After a stall the backlog is skipped, so the sound doesn't trail the picture.
 - A/V sync: video is held by the audio playout latency plus an A/V offset.
 - Video page: GPU (D3D11VA) or CPU decoding, GPU (Vulkan compute) or CPU colour
   conversion, Latency Lowest/Balanced/Smooth, graphics card and driver info.
 - Settings survive restarts in `%LOCALAPPDATA%\Glint`: `console.conf`,
-  `audio.conf`, `video.conf`, `capture.conf` (folder), `window.conf` (incl. theme),
-  `destinations.conf`, `oauth-apps.conf`. Rolling `glint.log` and a
-  diagnostics zip (Help page) without secrets.
+  `audio.conf`, `video.conf`, `picture.conf`, `capture.conf` (folder),
+  `window.conf` (incl. theme). Rolling `glint.log` and a diagnostics zip
+  (Help page) without secrets. While connected, `glint.log` gets a `stats:`
+  line every 10 s: received fps, network lateness, decode time, sound buffer,
+  frame sizes and the encoder's QP, for tuning latency and quality.
 - Headless modes for testing; `tests/mock_payload.js` serves the payload API
   from a recording when no console is available.
 
@@ -108,22 +104,18 @@ build/Glint.exe --url http://<ps5-ip>:7231 --audio-soak 60 --audio-exercise
 build/Glint.exe --url http://<ps5-ip>:7231 --audio-cycles 5    # start/stop thread check
 build/Glint.exe --url http://<ps5-ip>:7231 --record-test 60 --record-dir C:\tmp\rec
 build/Glint.exe --gallery-test C:\tmp\rec                      # list / export / delete
-build/Glint.exe --url http://<ps5-ip>:7231 --page 4            # open Settings on a tab (1-5)
+build/Glint.exe --url http://<ps5-ip>:7231 --page 4            # open Settings on a tab (1-6)
 build/Glint.exe --url http://<ps5-ip>:7231 --gallery           # open the gallery
 build/Glint.exe --url http://<ps5-ip>:7231 --theme light       # dark (default) or light
 build/Glint.exe --view C:\tmp\rec\clip.mkv                     # open a recording or screenshot in the viewer
-build/Glint.exe --url http://<ps5-ip>:7231 --broadcast-test 20 --broadcast-url rtmp://127.0.0.1:1935/live/key   # streaming builds only
-build/Glint.exe --tls-probe live.twitch.tv:443                 # TLS handshake only (streaming builds)
 build/Glint.exe --decode-file rec.mkv gpu                      # decoder check on a file
 ```
 
-Tests that touch settings or the vault honour `GLINT_SETTINGS_DIR` and
-`GLINT_VAULT_PREFIX`, so they never see your real destinations (`--store-test`
-and `--oauth-test` exist in streaming builds only):
+Tests that touch settings honour `GLINT_SETTINGS_DIR`, so they never see your
+real settings:
 
 ```bash
-GLINT_SETTINGS_DIR=/tmp/sl GLINT_VAULT_PREFIX=Glint-selftest build/Glint.exe --store-test
-GLINT_OAUTH_TEST_BASE=http://127.0.0.1:18080 build/Glint.exe --oauth-test twitch   # local mock
+GLINT_SETTINGS_DIR=/tmp/sl build/Glint.exe --settings-test
 ```
 
 The payload must be running on the console first. `--headless N` decodes N
@@ -142,22 +134,7 @@ src/media/audio.cpp           SDL2 audio: /audio thread -> ring -> callback
 src/media/recorder.cpp        local MKV recorder (H.264 copy + AAC, writer thread)
 src/media/media.cpp           screenshots, gallery, export
 src/media/player.cpp          built-in viewer's player (demux, decode, SDL sound clock)
-src/stream/broadcast.cpp      live encoder + per-destination RTMP writers
-src/stream/tls_relay.cpp      RTMPS through Windows TLS (Schannel)
-src/stream/destinations.cpp   stream-destinations.conf, Credential Manager vault
-src/stream/oauth.cpp          Twitch device flow, YouTube loopback + PKCE
 src/shaders/                  YUV -> RGBA compute shader (+ generated SPIR-V)
 tools/probe.cpp               headless transport probe / recorder
 vendor/imgui/                 Dear ImGui 1.91.9b
 ```
-
-## Live test checklist (streaming builds only)
-
-1. Use a throwaway or unlisted channel.
-2. Settings > Live streaming > Add a destination > Twitch / YouTube / Custom,
-   paste the stream key, Save. (Or sign in: Twitch needs a Client ID from
-   dev.twitch.tv/console; YouTube a Google "Desktop app" OAuth client ID and
-   secret with the YouTube Data API v3 enabled.)
-3. Pick quality (1080p60 6000 kbps is a good start), click Go live twice.
-4. Watch the destination rows: Connecting -> Live, kbps, any error text.
-5. End broadcast; the platform should show the stream ending normally.

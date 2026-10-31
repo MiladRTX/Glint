@@ -10,10 +10,14 @@ sl_options sl_opts = {
     .port = 7231,
     .height = 1080,
     .fps = 60,
-    /* About 35-38 Mbit/s in a busy game: clearly sharper than 20-30 (20 is
-     * blocky in fast motion), as smooth as 20 on a clean Wi-Fi stretch. Set
-     * once at start: the encoder can't change it on a running session. */
-    .bitrate = 50000000u,
+    /* The encoder also caps each frame at bitrate / 60. At 50 Mbit/s that cap
+     * (~104 KB) held fast motion at QP 22-28. At 100 Mbit/s a heavy 30 fps
+     * game filled the ~208 KB cap on every frame, ~95 Mbit/s, and frames came
+     * out up to 250 ms late with drops. Over a weak 5 GHz Wi-Fi link even a
+     * steady 50 stalled for seconds (GTA at 25-35 was smooth), so the default
+     * is 35. On a wired PS5, 75-100 gives sharper heavy scenes (bitrate=N).
+     * Set once at start: the encoder can't change it on a running session. */
+    .bitrate = 35000000u,
     .minqp = 18,
     .audio = 1,
 };

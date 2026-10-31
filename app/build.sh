@@ -41,12 +41,11 @@ windres res/glint.rc -O coff -o build/glint_res.o
 # -mwindows: a Windows app, so no console window opens with it. Test modes
 # reattach to the terminal they were started from (attach_parent_console()).
 g++ -std=c++17 -O2 -static -mwindows \
-  -Iinclude -Isrc -Isrc/core -Isrc/media -Isrc/stream -Ivendor/imgui -Ivendor/imgui/backends \
+  -Iinclude -Isrc -Isrc/core -Isrc/media -Ivendor/imgui -Ivendor/imgui/backends \
   $CFLAGS \
   src/main.cpp \
   src/core/app.cpp src/core/log.cpp src/core/payload_client.cpp src/core/settings.cpp \
   src/media/audio.cpp src/media/decoder.cpp src/media/media.cpp src/media/player.cpp src/media/recorder.cpp \
-  src/stream/broadcast.cpp src/stream/destinations.cpp src/stream/oauth.cpp src/stream/tls_relay.cpp \
   vendor/imgui/imgui.cpp \
   vendor/imgui/imgui_draw.cpp \
   vendor/imgui/imgui_tables.cpp \

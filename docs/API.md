@@ -111,7 +111,7 @@ float samples).
 
 ```json
 {
-  "version": "1.2.1",
+  "version": "1.3",
   "backend": "h264",
   "width": 1920,
   "height": 1080,
@@ -121,7 +121,7 @@ float samples).
   "kbps": 1008.8,
   "clients": 1,
   "viewers": 1,
-  "bitrate": 50000000,
+  "bitrate": 35000000,
   "recording": false,
   "recording_name": "",
   "recording_frames": 0,
@@ -211,11 +211,12 @@ new one per page) or, without it, by the client's IP address (the desktop app).
 
 ## Bitrate
 
-The encoder runs at **50 Mbit/s** (`bitrate` in `status.json`; a `bitrate=N`
-start argument changes it). In a busy game that comes out at about 35-38
-Mbit/s; a calm home screen needs far less. Measured over Wi-Fi (about 40 s
-of GTA each): 20 Mbit/s looked blocky in fast motion; 50 was as smooth as 20
-on a clean stretch, and hitched more only when the Wi-Fi itself was choppy.
+The encoder runs at **35 Mbit/s** (`bitrate` in `status.json`; a `bitrate=N`
+start argument changes it, up to 100 Mbit/s). The encoder also caps each
+frame at bitrate / 60, about 73 KB at 35 Mbit/s: a busy scene fills it and
+gets more compressed, a calm scene uses far less. Over a PS5 on Wi-Fi, a
+busy game at a steady 50 Mbit/s or more stalled; 35 stayed smooth. With the
+PS5 on a cable, 75-100 Mbit/s keeps busy scenes noticeably sharper.
 
 It is set once, before `Start`, and can't change while Glint runs (tested on a
 PS5, 13.60):

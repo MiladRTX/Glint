@@ -344,7 +344,14 @@ static int io_xfer(int op, pid_t pid, intptr_t addr, void *buf, size_t len)
  */
 static int wait_stop_sig(pid_t pid, int timeout_ms, int *sig)
 {
-    for (int waited = 0; waited < timeout_ms; waited += 5) {
+    /* Poll finely at first: most calls (ReadAudio, or ReadVideo with a frame
+     * ready) finish within microseconds, and a flat 5 ms sleep added up to
+     * 5 ms to each of the several calls made per video frame. Calls that
+     * block (ReadVideo waiting for the encoder) are still seen within 0.1 ms
+     * for a frame time; after that, back off. */
+    struct timespec t0, t;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (;;) {
         int status = 0;
         pid_t r = waitpid(pid, &status, WNOHANG | WUNTRACED);
         if (r == pid) {
@@ -353,9 +360,11 @@ static int wait_stop_sig(pid_t pid, int timeout_ms, int *sig)
             return 0;
         }
         if (r < 0 && errno != EINTR) return -1;
-        usleep(5000);
+        clock_gettime(CLOCK_MONOTONIC, &t);
+        int64_t us = (int64_t)(t.tv_sec - t0.tv_sec) * 1000000 + (t.tv_nsec - t0.tv_nsec) / 1000;
+        if (us >= (int64_t)timeout_ms * 1000) return 1;
+        usleep(us < 20000 ? 100 : us < 100000 ? 1000 : 5000);
     }
-    return 1;
 }
 
 static int64_t now_ms(void)

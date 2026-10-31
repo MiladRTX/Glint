@@ -15,7 +15,7 @@
  * buffers below and the server pumps them out.
  */
 
-#define SL_VERSION        "1.2.1"   /* shown in the console banner, capture.log and /status.json */
+#define SL_VERSION        "1.3"   /* shown in the console banner, capture.log and /status.json */
 #define SL_MAX_CLIENTS    16
 #define SL_MAX_STREAMING   8
 #define SL_VIDEO_SLOTS    64
